@@ -70,6 +70,10 @@ from vibe.app_server.models import (
 )
 from vibe.app_server.protocol import (
     AccountReadResponse,
+    ConfigFieldKind,
+    ConfigFieldsReadResponse,
+    ConfigFieldWire,
+    ConfigLayerValueWire,
     ConfigMutationResponse,
     EmptyResponse,
     FeedbackShouldShowResponse,
@@ -773,6 +777,22 @@ class _StaticResourceClient:
         del wait_for_incoming
         if method == "runtime/read":
             response: object = self._runtime
+        elif method == "config/fields/read":
+            alias = self._runtime.runtime.config.active_model.alias
+            response = ConfigFieldsReadResponse(
+                fields=[
+                    ConfigFieldWire(
+                        name="active_model",
+                        kind=ConfigFieldKind.ENUM,
+                        description="The model used by the attached FounderOS /ask session.",
+                        value=alias,
+                        path="active_model",
+                        enum_choices=[alias],
+                        layer_values=[ConfigLayerValueWire(layer="admin", value=alias)],
+                    )
+                ],
+                targets=[],
+            )
         elif method == "session/ready/wait":
             response = SessionReadyWaitResponse(ready=True, init_duration_ms=0)
         elif method == "workspace/prompt/prepare":
@@ -937,7 +957,7 @@ def _build_resources(
     )
     config = ConfigView(
         active_model=model,
-        active_model_pinned=False,
+        active_model_pinned=True,
         default_model_alias=model.alias,
         theme="auto",
         log_level="WARNING",

@@ -400,6 +400,22 @@ async def test_attached_resources_mount_the_existing_textual_ui(tmp_path: Path) 
         assert app.config.active_model.alias == "founderos-ask"
 
 
+@pytest.mark.asyncio
+async def test_attached_config_fields_report_admin_model_and_pin(
+    tmp_path: Path,
+) -> None:
+    session = FounderOSAskSession(transport=_FakeAskTransport(), cwd=tmp_path)
+
+    response = await session.resources.config.read_fields()
+
+    field = next(field for field in response.fields if field.name == "active_model")
+    assert field.origin == "admin"
+    assert field.value == "founderos-ask"
+    assert response.targets == []
+    assert session.resources.config.current.active_model_pinned is True
+    await session.close()
+
+
 def test_interactive_launcher_attaches_founderos_session_without_local_harness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
