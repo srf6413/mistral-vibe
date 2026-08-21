@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Protocol
 
 from pydantic import ValidationError
 
@@ -113,6 +114,73 @@ class AppServerTurnError(RuntimeError):
 class SessionExitSummary:
     session_id: str | None
     usage: TokenUsage
+
+
+class AppServerSessionClient(Protocol):
+    """Attached-session contract consumed by delivery surfaces.
+
+    ``AppServerSession`` is the default JSON-RPC implementation.  Keeping the
+    surface on this structural contract also lets another session transport
+    feed the same public events to a client without constructing Vibe's Python
+    agent loop.
+    """
+
+    resources: AppServerResources
+
+    @property
+    def session_id(self) -> str: ...
+
+    @property
+    def cwd(self) -> str: ...
+
+    @property
+    def history(self) -> list[PublicHistoryEntry]: ...
+
+    @property
+    def turn_active(self) -> bool: ...
+
+    def exit_summary(self) -> SessionExitSummary: ...
+
+    def act(
+        self,
+        message: str,
+        client_message_id: str | None = None,
+        *,
+        auto_title: str | None = None,
+        images: list[ImageAttachment] | None = None,
+        resources: list[UserResource] | None = None,
+        user_display_content: UserDisplayContent | None = None,
+        mention_stats: MentionStats | None = None,
+        injected: bool = False,
+    ) -> AsyncGenerator[AppServerEvent, None]: ...
+
+    def events(self) -> AsyncGenerator[AppServerEvent, None]: ...
+
+    async def inject_user_context(
+        self,
+        content: str,
+        *,
+        as_message: bool = False,
+        inject_invoked_skill: bool = False,
+        images: list[ImageAttachment] | None = None,
+        resources: list[UserResource] | None = None,
+        client_message_id: str | None = None,
+        mention_stats: MentionStats | None = None,
+    ) -> list[HistoryEntryAdded]: ...
+
+    async def interrupt(self) -> None: ...
+
+    async def respond_to_callback(
+        self, callback_id: str, output: CallbackOutput
+    ) -> None: ...
+
+    async def resume(self, session_id: str) -> None: ...
+
+    async def compact(self, extra_instructions: str = "") -> str: ...
+
+    async def clear_history(self) -> None: ...
+
+    async def close(self) -> None: ...
 
 
 class AppServerSession:

@@ -735,19 +735,19 @@ def test_run_cli_disabled_tools_concatenated_when_no_enabled_tools(
     assert "bash" in options.session_options.disabled_tools
 
 
-def test_run_cli_runs_update_prompt_before_interactive_start(
+def test_run_cli_interactive_bypasses_provider_config_and_update_prompt(
     monkeypatch: pytest.MonkeyPatch,
-    load_orchestrator: OrchestratorLoader[VibeConfigSchema],
 ) -> None:
     args = _make_args(prompt=None)
-    config = build_test_vibe_config()
     calls: list[str] = []
 
     monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
     monkeypatch.setattr(
         cli_mod,
         "load_config_orchestrator_or_exit",
-        lambda interactive: load_orchestrator(config),
+        lambda interactive: pytest.fail(
+            "attached local /ask must not load provider configuration"
+        ),
     )
     monkeypatch.setattr(cli_mod, "get_prompt_from_stdin", lambda: None)
     monkeypatch.setattr(
@@ -766,7 +766,7 @@ def test_run_cli_runs_update_prompt_before_interactive_start(
         cli_mod.run_cli(args)
 
     assert exc_info.value.code == 0
-    assert calls == ["update", "interactive"]
+    assert calls == ["interactive"]
 
 
 def test_run_cli_check_upgrade_exits_before_loading_config(

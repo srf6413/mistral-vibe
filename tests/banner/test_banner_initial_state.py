@@ -53,6 +53,10 @@ def _banner_model_text(banner: Banner) -> str:
     return str(banner.query_one("#banner-model", NoMarkupStatic).content)
 
 
+def _banner_brand_text(banner: Banner) -> str:
+    return str(banner.query_one("#banner-brand", NoMarkupStatic).content)
+
+
 def _mcp_server(name: str, *, disabled: bool = False) -> MCPSourceSummary:
     return MCPSourceSummary(
         name=name,
@@ -111,6 +115,17 @@ class TestBannerInitialState:
         )
 
         assert banner._initial_state.active_model == "glm-5.2 (Mistral Hosted)[off]"
+
+    @pytest.mark.asyncio
+    async def test_banner_uses_ysf_brand_without_decorative_art(self) -> None:
+        banner = Banner(config=_make_config(), skills_count=0)
+        app = _BannerHostApp(banner)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            assert _banner_brand_text(banner) == "YSF Vibe"
+            assert not banner.query(".petit-chat")
 
     def test_format_meta_counts_includes_connectors(self) -> None:
         banner = Banner(config=_make_config(), skills_count=0)

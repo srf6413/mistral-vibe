@@ -24,6 +24,45 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 > [!WARNING]
 > Mistral Vibe works on Windows, but we officially support and target UNIX environments.
 
+## YSF local `/ask` terminal
+
+This fork keeps Vibe as the terminal UI and sends interactive conversation turns
+to FounderOS as the sole router. Jarvis keeps a stable M2-local front door at
+`http://127.0.0.1:8000/ask?workspace=ysf`. Today the `scripts/jarvis` launcher
+opens a persistent SSH forward from that address to the Intel dev-tip `/ask` on
+`:8010`; the future local `/ask` core can replace the bridge without changing the
+terminal contract. It never falls back directly to a model provider.
+
+- `FOUNDEROS_ASK_URL` may select another explicit endpoint. The automatic Intel
+  bridge runs only for the default local front door.
+- `FOUNDEROS_INTEL_SSH_HOST` changes the SSH alias; the default is `intel-mac`
+  (`ysf@intel` in the existing SSH config).
+- `jarvis --intel-tunnel-status` checks the front door and
+  `jarvis --stop-intel-tunnel` provides the explicit stop path.
+- `FOUNDEROS_WORKSPACE` changes the workspace query value; the default is `ysf`.
+- `FOUNDEROS_API_KEY` is optional for a local service configured to require it.
+- `FOUNDEROS_INTAKE_MODEL` and `FOUNDEROS_WORKER_MODEL` pin the two compute
+  roles independently; each defaults to `auto` and neither rewrites the other.
+- `--resume SESSION_ID` reuses the stable FounderOS frontend session ID. Session
+  listing (`--resume` without an ID) and `--continue` fail closed because `/ask`
+  does not expose those discovery operations.
+
+When the local `/ask` service rejects the session credential with HTTP 401/403,
+the terminal surfaces an explicit `FOUNDEROS_API_KEY` guidance error instead of a
+generic stream failure. The credential is sent only as the `X-API-Key` header and
+is never logged, persisted, or echoed back in an error message. Backend `error`
+events are projected as a receipt-backed failure: Vibe keeps the backend `run_id`
+from the stream and shows it together with the structured error code and message,
+and never claims provider success without a backend receipt.
+
+The terminal keeps local `!` commands and renders `/ask` SSE deltas through
+Vibe's existing event path. HTTP cancellation stops stream delivery; authoritative
+server cancellation still depends on FounderOS PR #2495 exposing run control at
+the `/ask` boundary. The independent `intake_model` and `worker_model` fields are
+sent as `auto` by default and become authoritative with FounderOS PR #2496.
+Voice is intentionally outside this typed-terminal V1; the existing FounderOS
+mobile/web duplex path remains the canonical voice implementation.
+
 ### One-line install (recommended)
 
 **Linux and macOS**

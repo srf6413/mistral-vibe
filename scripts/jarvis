@@ -1,0 +1,176 @@
+#!/bin/zsh
+set -eu
+
+founderos_root="/Users/sauloferreira/dev/FounderOS"
+jarvis_root="/Users/sauloferreira/dev/mistral-vibe-ysf"
+jarvis_python="$jarvis_root/.venv/bin/python"
+jarvis_default_ask_url="http://127.0.0.1:8000/ask"
+jarvis_intel_host="${FOUNDEROS_INTEL_SSH_HOST:-intel-mac}"
+jarvis_tunnel_socket="/tmp/jarvis-intel-ask-${UID}.sock"
+
+front_door_healthy() {
+  curl -fsS --max-time 2 "http://127.0.0.1:8000/health" 2>/dev/null \
+    | grep -q '"status"[[:space:]]*:[[:space:]]*"healthy"'
+}
+
+stop_intel_tunnel() {
+  ssh -S "$jarvis_tunnel_socket" -O exit "$jarvis_intel_host" \
+    >/dev/null 2>&1 || true
+  if [[ -e "$jarvis_tunnel_socket" || -S "$jarvis_tunnel_socket" ]]; then
+    rm -f -- "$jarvis_tunnel_socket"
+  fi
+}
+
+ensure_intel_front_door() {
+  if front_door_healthy; then
+    return 0
+  fi
+
+  # A stale master can leave a socket behind while forwarding nothing.
+  if ssh -S "$jarvis_tunnel_socket" -O check "$jarvis_intel_host" \
+    >/dev/null 2>&1; then
+    stop_intel_tunnel
+  elif [[ -e "$jarvis_tunnel_socket" || -S "$jarvis_tunnel_socket" ]]; then
+    rm -f -- "$jarvis_tunnel_socket"
+  fi
+
+  if ! ssh -fNT -M -S "$jarvis_tunnel_socket" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=6 \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -L 127.0.0.1:8000:127.0.0.1:8010 \
+    "$jarvis_intel_host"; then
+    print -u2 "jarvis: could not open the FounderOS /ask bridge to ysf@intel"
+    return 1
+  fi
+
+  local attempt
+  for attempt in {1..20}; do
+    if front_door_healthy; then
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  stop_intel_tunnel
+  print -u2 "jarvis: Intel /ask did not become healthy through the local front door"
+  return 1
+}
+
+load_dev_api_key() {
+  local config_path="${FOUNDEROS_DESKTOP_CONFIG:-$HOME/Library/Application Support/Claude/claude_desktop_config.json}"
+  "$jarvis_python" - "$config_path" "$jarvis_ask_url" <<'PY'
+import json
+from pathlib import Path
+import sys
+from urllib import error, request
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text()) if Path(sys.argv[1]).is_file() else {}
+except (OSError, ValueError):
+    payload = {}
+
+ask_url = sys.argv[2]
+health_url = ask_url.rsplit("/ask", 1)[0] + "/health"
+auth_probe_url = ask_url.rsplit("/ask", 1)[0] + "/settings/canonical-backend"
+try:
+    with request.urlopen(health_url, timeout=3) as response:
+        health = json.load(response)
+except (OSError, ValueError):
+    raise SystemExit(1)
+
+servers = payload.get("mcpServers") or {}
+candidates: list[str] = []
+if health.get("server_env") == "dev":
+    # FounderOS intentionally falls back to this key only when no real dev key
+    # is configured. Never try it against staging or production.
+    candidates.append("dev-key")
+for name in ("FounderOS-dev", "FounderOS-dev-tip", "FounderOS"):
+    value = ((servers.get(name) or {}).get("env") or {}).get("FOUNDEROS_API_KEY")
+    if isinstance(value, str) and value.strip() and value not in candidates:
+        candidates.append(value)
+
+for candidate in candidates:
+    probe = request.Request(
+        auth_probe_url,
+        headers={"X-API-Key": candidate},
+        method="GET",
+    )
+    try:
+        with request.urlopen(probe, timeout=5) as response:
+            status = response.status
+    except error.HTTPError as exc:
+        status = exc.code
+    except OSError:
+        continue
+    if status == 200:
+        print(candidate, end="")
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+case "${1:-}" in
+  --stop-intel-tunnel)
+    stop_intel_tunnel
+    print "jarvis: Intel /ask bridge stopped"
+    exit 0
+    ;;
+  --intel-tunnel-status)
+    if front_door_healthy; then
+      print "jarvis: FounderOS /ask front door is healthy"
+      exit 0
+    fi
+    print -u2 "jarvis: FounderOS /ask front door is unavailable"
+    exit 1
+    ;;
+esac
+
+# Keep each terminal in the repo/worktree it was launched from. Outside Git,
+# fall back to the primary FounderOS checkout.
+if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  jarvis_workdir="$PWD"
+else
+  jarvis_workdir="$founderos_root"
+fi
+
+if [[ ! -x "$jarvis_python" ]]; then
+  print -u2 "jarvis: local YSF terminal runtime is unavailable at $jarvis_python"
+  exit 1
+fi
+
+# Keep localhost as Jarvis's stable front door. Until the thin /ask core moves
+# onto this Mac, the launcher owns a persistent SSH forward to Intel tip :8010.
+jarvis_ask_url="${FOUNDEROS_ASK_URL:-$jarvis_default_ask_url}"
+if [[ "$jarvis_ask_url" == "$jarvis_default_ask_url" ]]; then
+  ensure_intel_front_door
+fi
+export FOUNDEROS_ASK_URL="$jarvis_ask_url"
+export FOUNDEROS_WORKSPACE="${FOUNDEROS_WORKSPACE:-ysf}"
+export FOUNDEROS_INTAKE_MODEL="${FOUNDEROS_INTAKE_MODEL:-auto}"
+export FOUNDEROS_WORKER_MODEL="${FOUNDEROS_WORKER_MODEL:-auto}"
+
+if [[ -z "${FOUNDEROS_API_KEY:-}" ]]; then
+  if founderos_api_key="$(load_dev_api_key)"; then
+    export FOUNDEROS_API_KEY="$founderos_api_key"
+  else
+    print -u2 "jarvis: no FounderOS dev API key is available"
+    exit 1
+  fi
+fi
+
+# Programmatic Vibe still owns a separate provider path upstream. Refuse it on
+# the `jarvis` command until it is attached to /ask too; `vibe` remains available
+# separately for intentional upstream-provider experiments.
+for arg in "$@"; do
+  case "$arg" in
+    -p|--prompt|--prompt=*)
+      print -u2 "jarvis: programmatic mode is not yet routed through FounderOS /ask"
+      exit 2
+      ;;
+  esac
+done
+
+exec "$jarvis_python" -m vibe.cli.entrypoint --workdir "$jarvis_workdir" "$@"
