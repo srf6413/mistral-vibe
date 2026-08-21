@@ -31,7 +31,12 @@ from textual.widgets import Static
 from textual.worker import Worker, WorkerFailed, WorkerState
 
 from vibe import __version__ as CORE_VERSION
-from vibe.app_server import AppServerHost, AppServerSession, SessionExitSummary
+from vibe.app_server import (
+    AppServerHost,
+    AppServerSession,
+    AppServerSessionClient,
+    SessionExitSummary,
+)
 from vibe.app_server.config import (
     THINKING_LEVELS,
     ConfigView,
@@ -531,16 +536,18 @@ class _PickerState:
 
 
 type AppServerStarter = Callable[[], Awaitable[AppServerSession]]
-type AppServerSource = AppServerSession | AppServerStarter
-type AppServerBootstrap = Callable[[], Awaitable[AppServerHost | AppServerSession]]
+type AppServerSource = AppServerSessionClient | AppServerStarter
+type AppServerBootstrap = Callable[
+    [], Awaitable[AppServerHost | AppServerSessionClient]
+]
 
 
 def _split_app_server_source(
     source: AppServerSource,
-) -> tuple[AppServerSession | None, AppServerStarter | None]:
-    if isinstance(source, AppServerSession):
-        return source, None
-    return None, source
+) -> tuple[AppServerSessionClient | None, AppServerStarter | None]:
+    if callable(source):
+        return None, source
+    return source, None
 
 
 class _IdleNarratorManager:
@@ -729,7 +736,7 @@ class VibeApp(App):  # noqa: PLR0904
         self._session_ready.set()
 
     @property
-    def app_server(self) -> AppServerSession:
+    def app_server(self) -> AppServerSessionClient:
         if self._app_server is None:
             raise RuntimeError("App server has not been started")
         return self._app_server
