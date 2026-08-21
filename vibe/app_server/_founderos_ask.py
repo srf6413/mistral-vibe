@@ -111,6 +111,15 @@ class FounderOSAskStreamError(FounderOSAskError):
     """The local service returned an invalid or unsuccessful stream."""
 
 
+class FounderOSAskAuthError(FounderOSAskError):
+    """The local service rejected the session authentication for /ask.
+
+    Reached only from a server-side 401/403 after the request was sent, so a
+    present-but-invalid credential and a missing credential look the same to
+    the terminal. Neither the credential nor its value is ever included here.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class AskPins:
     """Independent compute pins accepted by the FounderOS /ask router."""
@@ -195,6 +204,10 @@ class HttpFounderOSAskTransport:
                 ) as response:
                     self._active_response = response
                     if not response.is_success:
+                        if response.status_code in {401, 403}:
+                            raise FounderOSAskAuthError(
+                                _auth_error_message(response.status_code)
+                            )
                         raise FounderOSAskStreamError(
                             "Local FounderOS /ask rejected the request "
                             f"(HTTP {response.status_code}); no provider fallback attempted"
@@ -293,6 +306,15 @@ def _require_safe_endpoint(endpoint: str) -> None:
         raise ValueError("Non-loopback FounderOS /ask endpoints must use HTTPS")
 
 
+def _auth_error_message(status_code: int) -> str:
+    return (
+        "FounderOS /ask rejected the session authentication "
+        f"(HTTP {status_code}) on the local /ask transport. "
+        "Set FOUNDEROS_API_KEY to a valid key for this service and try again. "
+        "No provider fallback attempted."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _EventsClosed:
     pass
@@ -322,6 +344,7 @@ class FounderOSAskSession:
         self._turn_active = False
         self._active_turn_id: str | None = None
         self._interrupted_turn_ids: set[str] = set()
+        self._run_id: str | None = None
         self._events: asyncio.Queue[AppServerEvent | _EventsClosed] = asyncio.Queue(
             maxsize=64
         )
@@ -374,6 +397,11 @@ class FounderOSAskSession:
     @property
     def turn_active(self) -> bool:
         return self._turn_active
+
+    @property
+    def run_id(self) -> str | None:
+        """Latest FounderOS /ask run ID seen on the stream (the backend receipt)."""
+        return self._run_id
 
     def exit_summary(self) -> SessionExitSummary:
         return SessionExitSummary(session_id=self._session_id, usage=TokenUsage())
@@ -439,6 +467,9 @@ class FounderOSAskSession:
             yield TurnStarted(turn)
             async with aclosing(self._transport.stream(payload)) as stream:
                 async for event in stream:
+                    run_id = self._run_id or _event_run_id(event)
+                    if run_id:
+                        self._run_id = run_id
                     event_type = event.get("type")
                     if event_type in {
                         "text_delta",
@@ -472,7 +503,13 @@ class FounderOSAskSession:
                                 )
                         continue
                     if event_type == "error":
-                        raise FounderOSAskStreamError(_event_error(event))
+                        raise FounderOSAskStreamError(
+                            _format_run_error(
+                                _event_error(event),
+                                code=_event_code(event),
+                                run_id=self._run_id,
+                            )
+                        )
                     if event_type in {"awaiting_permission", "awaiting_clarification"}:
                         raise FounderOSAskStreamError(
                             "FounderOS /ask paused for input, but checkpoint resume "
@@ -720,6 +757,68 @@ def _event_error(event: Mapping[str, Any]) -> str:
             if isinstance(value, str) and value:
                 return value
     return "FounderOS /ask stream failed"
+
+
+def _event_code(event: Mapping[str, Any]) -> str | None:
+    """Structured backend error code on a FounderOS /ask error event."""
+    data = event.get("data")
+    if isinstance(data, Mapping):
+        for key in ("code", "error_code", "reason"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+    for key in ("code", "error_code"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _event_run_id(event: Mapping[str, Any]) -> str | None:
+    """Best-effort run ID (the provider receipt reference) on any /ask event.
+
+    The exact nesting varies by FounderOS build, so this searches the common
+    shapes without throwing on an unexpected payload. Values that are blank or
+    the ``-`` sentinel the backend uses for an absent reference are ignored.
+    """
+    containers: list[object] = [event]
+    data = event.get("data")
+    if isinstance(data, Mapping):
+        containers.append(data)
+        for key in ("run", "meta", "receipt"):
+            nested = data.get(key)
+            if isinstance(nested, Mapping):
+                containers.append(nested)
+    for container in containers:
+        if not isinstance(container, Mapping):
+            continue
+        for key in ("run_id", "runId", "frontend_run_id"):
+            value = container.get(key)
+            if isinstance(value, str) and value and value != "-":
+                return value
+        run = container.get("run")
+        if isinstance(run, Mapping):
+            for key in ("id", "run_id", "runId"):
+                value = run.get(key)
+                if isinstance(value, str) and value and value != "-":
+                    return value
+    return None
+
+
+def _format_run_error(message: str, *, code: str | None, run_id: str | None) -> str:
+    """Compose the user-visible receipt-backed failure for a backend error."""
+    head = "FounderOS /ask"
+    if run_id:
+        head += f" run {run_id}"
+    head += f" failed ({code})" if code else " failed"
+    lines = [head]
+    if message and message != "FounderOS /ask stream failed":
+        lines.append(message)
+    lines.append(
+        "The local /ask run did not succeed, so Vibe is not claiming provider "
+        "success and no fallback was attempted."
+    )
+    return "\n".join(lines)
 
 
 def _final_text(event: Mapping[str, Any]) -> str:

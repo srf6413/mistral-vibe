@@ -47,6 +47,14 @@ terminal contract. It never falls back directly to a model provider.
   listing (`--resume` without an ID) and `--continue` fail closed because `/ask`
   does not expose those discovery operations.
 
+When the local `/ask` service rejects the session credential with HTTP 401/403,
+the terminal surfaces an explicit `FOUNDEROS_API_KEY` guidance error instead of a
+generic stream failure. The credential is sent only as the `X-API-Key` header and
+is never logged, persisted, or echoed back in an error message. Backend `error`
+events are projected as a receipt-backed failure: Vibe keeps the backend `run_id`
+from the stream and shows it together with the structured error code and message,
+and never claims provider success without a backend receipt.
+
 The terminal keeps local `!` commands and renders `/ask` SSE deltas through
 Vibe's existing event path. HTTP cancellation stops stream delivery; authoritative
 server cancellation still depends on FounderOS PR #2495 exposing run control at

@@ -12,7 +12,9 @@ import pytest
 
 from vibe.app_server import (
     AskPins,
+    FounderOSAskAuthError,
     FounderOSAskSession,
+    FounderOSAskStreamError,
     FounderOSAskUnavailableError,
     HttpFounderOSAskTransport,
 )
@@ -448,3 +450,164 @@ def test_interactive_launcher_attaches_founderos_session_without_local_harness(
     startup = cast(dict[str, Any], captured["tui"])["startup"]
     assert startup.prompt_for_workspace_trust is False
     assert startup.show_resume_picker is False
+
+
+@pytest.mark.asyncio
+async def test_http_transport_sends_api_key_as_x_api_key_header_when_configured() -> (
+    None
+):
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream; charset=utf-8"},
+            stream=_ChunkedStream([
+                b'data: {"type":"final_result","data":{"answer":"ok"}}\n\n'
+            ]),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpFounderOSAskTransport(
+        endpoint="http://127.0.0.1:8000/ask",
+        workspace="ysf",
+        api_key="dev-key",
+        client=client,
+    )
+
+    _ = [event async for event in transport.stream({"text": "hi"})]
+
+    assert requests[0].headers["x-api-key"] == "dev-key"
+    assert requests[0].headers.get("authorization") is None
+    await transport.close()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_transport_omits_auth_header_without_an_api_key() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream; charset=utf-8"},
+            stream=_ChunkedStream([
+                b'data: {"type":"final_result","data":{"answer":"ok"}}\n\n'
+            ]),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpFounderOSAskTransport(client=client)
+
+    _ = [event async for event in transport.stream({"text": "hi"})]
+
+    assert "x-api-key" not in requests[0].headers
+    assert "authorization" not in requests[0].headers
+    await transport.close()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_transport_surfaces_actionable_auth_error_and_never_leaks_key() -> (
+    None
+):
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(401, text="Unauthorized: provide a valid credential")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpFounderOSAskTransport(
+        endpoint="http://127.0.0.1:8000/ask", api_key="super-secret-key", client=client
+    )
+
+    with pytest.raises(FounderOSAskAuthError) as exc_info:
+        _ = [event async for event in transport.stream({"text": "hi"})]
+
+    message = str(exc_info.value)
+    assert "HTTP 401" in message
+    assert "FOUNDEROS_API_KEY" in message
+    assert "No provider fallback attempted" in message
+    # The raw credential must never surface, even on rejection.
+    assert "super-secret-key" not in message
+    assert calls == 1
+    await transport.close()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_session_preserves_run_id_and_renders_structured_backend_error(
+    tmp_path: Path,
+) -> None:
+    transport = _FakeAskTransport([
+        {"type": "run_created", "data": {"run_id": "arc-1787306269146-ee2abe5f439a"}},
+        {
+            "type": "error",
+            "code": "ask_execution_error",
+            "message": "The run did not complete successfully.",
+        },
+    ])
+    session = FounderOSAskSession(transport=transport, cwd=tmp_path)
+
+    with pytest.raises(FounderOSAskStreamError) as exc_info:
+        _ = [event async for event in session.act("go")]
+
+    assert session.run_id == "arc-1787306269146-ee2abe5f439a"
+    message = str(exc_info.value)
+    assert "arc-1787306269146-ee2abe5f439a" in message
+    assert "ask_execution_error" in message
+    assert "The run did not complete successfully." in message
+    assert "not claiming provider success" in message
+    # Exactly one request, no cancel, no fallback.
+    assert len(transport.payloads) == 1
+    assert transport.cancel_count == 0
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_session_preserves_run_id_on_success_and_still_yields_turn_completed(
+    tmp_path: Path,
+) -> None:
+    transport = _FakeAskTransport([
+        {
+            "type": "final_result",
+            "data": {"run": {"id": "arc-success-42"}, "answer": "done"},
+        }
+    ])
+    session = FounderOSAskSession(transport=transport, cwd=tmp_path)
+
+    events = [event async for event in session.act("go")]
+
+    assert session.run_id == "arc-success-42"
+    assert isinstance(events[-1], TurnCompleted)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_session_ignores_absent_run_id_sentinel_and_reports_unknown_receipt(
+    tmp_path: Path,
+) -> None:
+    transport = _FakeAskTransport([
+        {
+            "type": "error",
+            "code": "ask_execution_error",
+            "data": {"run_id": "-"},
+            "message": "boom",
+        }
+    ])
+    session = FounderOSAskSession(transport=transport, cwd=tmp_path)
+
+    with pytest.raises(FounderOSAskStreamError) as exc_info:
+        _ = [event async for event in session.act("go")]
+
+    assert session.run_id is None
+    message = str(exc_info.value)
+    assert "boom" in message
+    assert "not claiming provider success" in message
+    # The absent run id sentinel must not be rendered as a run reference.
+    assert "run -" not in message
+    await session.close()

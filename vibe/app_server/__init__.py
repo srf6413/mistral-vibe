@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from vibe.app_server._founderos_ask import (
     AskPins,
+    FounderOSAskAuthError,
     FounderOSAskError,
     FounderOSAskSession,
     FounderOSAskStreamError,
@@ -22,6 +23,7 @@ __all__ = [
     "AppServerSessionClient",
     "AskPins",
     "ClientToolHandler",
+    "FounderOSAskAuthError",
     "FounderOSAskError",
     "FounderOSAskSession",
     "FounderOSAskStreamError",
