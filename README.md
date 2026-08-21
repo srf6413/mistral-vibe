@@ -27,13 +27,18 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 ## YSF local `/ask` terminal
 
 This fork keeps Vibe as the terminal UI and sends interactive conversation turns
-to FounderOS as the sole router. It defaults to the M2-local endpoint
-`http://127.0.0.1:8000/ask?workspace=ysf`; it does not require Intel, tailnet, or
-any remote backend, and it never falls back to a model provider when that local
-service is unavailable.
+to FounderOS as the sole router. Jarvis keeps a stable M2-local front door at
+`http://127.0.0.1:8000/ask?workspace=ysf`. Today the `scripts/jarvis` launcher
+opens a persistent SSH forward from that address to the Intel dev-tip `/ask` on
+`:8010`; the future local `/ask` core can replace the bridge without changing the
+terminal contract. It never falls back directly to a model provider.
 
-- `FOUNDEROS_ASK_URL` may select another explicit endpoint. Non-loopback dev
-  backends (including Intel) require HTTPS and are never tried automatically.
+- `FOUNDEROS_ASK_URL` may select another explicit endpoint. The automatic Intel
+  bridge runs only for the default local front door.
+- `FOUNDEROS_INTEL_SSH_HOST` changes the SSH alias; the default is `intel-mac`
+  (`ysf@intel` in the existing SSH config).
+- `jarvis --intel-tunnel-status` checks the front door and
+  `jarvis --stop-intel-tunnel` provides the explicit stop path.
 - `FOUNDEROS_WORKSPACE` changes the workspace query value; the default is `ysf`.
 - `FOUNDEROS_API_KEY` is optional for a local service configured to require it.
 - `FOUNDEROS_INTAKE_MODEL` and `FOUNDEROS_WORKER_MODEL` pin the two compute
