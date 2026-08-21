@@ -11,7 +11,6 @@ from textual.widgets import Static
 from vibe import __version__
 from vibe.app_server.config import ConfigView
 from vibe.app_server.models import MCPSourceKind, MCPSourceStatus, MCPState
-from vibe.cli.textual_ui.widgets.banner.petit_chat import PetitChat
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.spinner_text import SpinnerText
 
@@ -65,15 +64,12 @@ class Banner(Static):
             plan_description=None,
             model_pending=model_pending,
         )
-        self._animated = not (config is None or config.disable_welcome_banner_animation)
 
     def compose(self) -> ComposeResult:
         with VerticalGroup(id="banner-container"):
-            yield PetitChat(animate=self._animated)
-
             with Vertical(id="banner-info"):
                 with Horizontal(classes="banner-line"):
-                    yield NoMarkupStatic("Mistral Vibe", id="banner-brand")
+                    yield NoMarkupStatic("YSF Vibe", id="banner-brand")
                     yield NoMarkupStatic(" ", classes="banner-spacer")
                     yield NoMarkupStatic(f"v{__version__} · ", classes="banner-meta")
                     yield SpinnerText(id="banner-model")
@@ -102,8 +98,7 @@ class Banner(Static):
         plan.update(self._format_plan())
 
     def freeze_animation(self) -> None:
-        if self._animated:
-            self.query_one(PetitChat).freeze_animation()
+        """Retain the public hook now that the banner has no animated art."""
 
     def set_state(
         self,
