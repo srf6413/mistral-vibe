@@ -212,65 +212,47 @@ def _run_interactive_mode(
     stdin_prompt: str | None,
     update_cache_repository: UpdateCacheRepository,
 ) -> None:
-    from vibe.app_server.local import (
-        ClientDescriptor,
-        LocalHarness,
-        LocalHarnessOptions,
-    )
-    from vibe.app_server.protocol import (
-        AppServerResponseError,
-        ClientCapabilities,
-        ClientInfo,
-        SessionOptions,
-    )
+    from vibe.app_server import FounderOSAskError, FounderOSAskSession
+    from vibe.app_server.protocol import AppServerResponseError
     from vibe.cli.textual_ui.app import StartupOptions, run_textual_ui
 
-    harness = LocalHarness(
-        LocalHarnessOptions(
-            experimental_harness=args.experimental_harness,
-            client=ClientDescriptor(
-                info=ClientInfo(
-                    name="vibe_tui",
-                    title="Vibe Textual",
-                    version=__version__,
-                    entrypoint="cli",
-                    terminal_emulator=detect_terminal(),
-                ),
-                capabilities=ClientCapabilities(
-                    callback_kinds=["approval", "user_input"]
-                ),
-            ),
-            session_options=SessionOptions(
-                cwd=str(Path.cwd()),
-                workspace_roots=list(args.add_dir),
-                agent=args.agent,
-                auto_approve=args.auto_approve,
-                enabled_tools=args.enabled_tools,
-                disabled_tools=list(args.disabled_tools or ()),
-                trust_workspace=bool(args.trust or args.worktree),
-            ),
-            session=_session_intent(args, allow_picker=True),
+    if args.resume is True:
+        rprint(
+            "[red]Error:[/] Local FounderOS /ask does not expose a session-list "
+            "endpoint. Pass an explicit session ID with --resume SESSION_ID."
         )
-    )
+        sys.exit(1)
+    if args.continue_session:
+        rprint(
+            "[red]Error:[/] Local FounderOS /ask does not expose a latest-session "
+            "endpoint. Pass an explicit session ID with --resume SESSION_ID."
+        )
+        sys.exit(1)
+
+    resume_session_id = args.resume if isinstance(args.resume, str) else None
+    session = FounderOSAskSession.local(cwd=Path.cwd(), session_id=resume_session_id)
+
+    async def start_attached_session() -> FounderOSAskSession:
+        return session
+
     try:
         summary = run_textual_ui(
-            start_app_server=harness.connect,
+            start_app_server=start_attached_session,
             history_file=HISTORY_FILE.path,
             update_cache_repository=update_cache_repository,
             startup=StartupOptions(
                 initial_prompt=args.initial_prompt or stdin_prompt,
-                teleport_on_start=args.teleport,
-                show_resume_picker=args.resume is True,
-                is_resuming_session=(
-                    args.continue_session or isinstance(args.resume, str)
-                ),
-                prompt_for_workspace_trust=True,
-                resume_session_id=(
-                    args.resume if isinstance(args.resume, str) else None
-                ),
-                continue_latest=bool(args.continue_session),
+                teleport_on_start=False,
+                show_resume_picker=False,
+                is_resuming_session=resume_session_id is not None,
+                prompt_for_workspace_trust=False,
+                resume_session_id=None,
+                continue_latest=False,
             ),
         )
+    except FounderOSAskError as exc:
+        rprint(f"[red]Error:[/] {exc}")
+        sys.exit(1)
     except AppServerResponseError as exc:
         rprint(f"[red]Error:[/] {exc.error.message}")
         sys.exit(1)
@@ -408,15 +390,6 @@ def run_cli(args: argparse.Namespace) -> None:
             sys.exit(0)
 
         is_interactive = args.prompt is None
-        orchestrator = load_config_orchestrator_or_exit(interactive=is_interactive)
-        config = orchestrator.config
-        if is_interactive:
-            _maybe_run_startup_update_prompt(config, update_cache_repository)
-        sentry_enabled = init_sentry(
-            enabled=config.enable_telemetry,
-            headless=not is_interactive,
-            tags=_build_cli_launch_context().sentry_tags(),
-        )
         stdin_prompt = get_prompt_from_stdin()
         if is_interactive:
             _run_interactive_mode(
@@ -425,6 +398,13 @@ def run_cli(args: argparse.Namespace) -> None:
                 update_cache_repository=update_cache_repository,
             )
         else:
+            orchestrator = load_config_orchestrator_or_exit(interactive=False)
+            config = orchestrator.config
+            sentry_enabled = init_sentry(
+                enabled=config.enable_telemetry,
+                headless=True,
+                tags=_build_cli_launch_context().sentry_tags(),
+            )
             _run_programmatic_mode(args=args, stdin_prompt=stdin_prompt)
 
     except (KeyboardInterrupt, EOFError):

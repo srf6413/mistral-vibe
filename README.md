@@ -24,6 +24,32 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 > [!WARNING]
 > Mistral Vibe works on Windows, but we officially support and target UNIX environments.
 
+## YSF local `/ask` terminal
+
+This fork keeps Vibe as the terminal UI and sends interactive conversation turns
+to FounderOS as the sole router. It defaults to the M2-local endpoint
+`http://127.0.0.1:8000/ask?workspace=ysf`; it does not require Intel, tailnet, or
+any remote backend, and it never falls back to a model provider when that local
+service is unavailable.
+
+- `FOUNDEROS_ASK_URL` may select another explicit endpoint. Non-loopback dev
+  backends (including Intel) require HTTPS and are never tried automatically.
+- `FOUNDEROS_WORKSPACE` changes the workspace query value; the default is `ysf`.
+- `FOUNDEROS_API_KEY` is optional for a local service configured to require it.
+- `FOUNDEROS_INTAKE_MODEL` and `FOUNDEROS_WORKER_MODEL` pin the two compute
+  roles independently; each defaults to `auto` and neither rewrites the other.
+- `--resume SESSION_ID` reuses the stable FounderOS frontend session ID. Session
+  listing (`--resume` without an ID) and `--continue` fail closed because `/ask`
+  does not expose those discovery operations.
+
+The terminal keeps local `!` commands and renders `/ask` SSE deltas through
+Vibe's existing event path. HTTP cancellation stops stream delivery; authoritative
+server cancellation still depends on FounderOS PR #2495 exposing run control at
+the `/ask` boundary. The independent `intake_model` and `worker_model` fields are
+sent as `auto` by default and become authoritative with FounderOS PR #2496.
+Voice is intentionally outside this typed-terminal V1; the existing FounderOS
+mobile/web duplex path remains the canonical voice implementation.
+
 ### One-line install (recommended)
 
 **Linux and macOS**
