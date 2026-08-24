@@ -64,6 +64,18 @@ class LazyVoiceManager:
             return
         self._materialize().apply_enabled(enabled)
 
+    @property
+    def muted(self) -> bool:
+        if self._manager is None:
+            return False
+        return self._manager.muted
+
+    @muted.setter
+    def muted(self, value: bool) -> None:
+        if self._manager is None and not value:
+            return
+        self._materialize().muted = value
+
     def start_recording(self, mode: RecordingMode = RecordingMode.STREAM) -> None:
         self._materialize().start_recording(mode)
 

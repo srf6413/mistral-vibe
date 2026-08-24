@@ -75,6 +75,9 @@ class VoiceManager:
         self._transcribe_task: Task[None] | None = None
         self._listeners: list[VoiceManagerListener] = []
         self._tracking = TranscriptionTrackingState()
+        # Single source of truth for mic-capture suppression; see
+        # VoiceManagerPort.muted.
+        self.muted: bool = False
 
     @property
     def is_enabled(self) -> bool:

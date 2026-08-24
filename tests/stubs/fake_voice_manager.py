@@ -20,6 +20,7 @@ class FakeVoiceManager:
         self._audio_recorder: AudioRecorderPort = audio_recorder or FakeAudioRecorder()
         self._transcribe_state = TranscribeState.IDLE
         self._listeners: list[VoiceManagerListener] = []
+        self.muted: bool = False
 
     @property
     def is_enabled(self) -> bool:

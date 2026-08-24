@@ -98,6 +98,7 @@ from vibe.app_server.protocol import (
 )
 from vibe.app_server.session import AppServerTurnError
 from vibe.cli._process_title import process_id_label
+from vibe.cli.audio_player.mute_sound_cue import play_mute_cue
 from vibe.cli.clipboard import (
     NATIVE_COPY_HINT,
     ClipboardCopyResult,
@@ -578,6 +579,13 @@ class _IdleVoiceManager:
     def peak(self) -> float:
         return 0.0
 
+    @property
+    def muted(self) -> bool:
+        return False
+
+    @muted.setter
+    def muted(self, value: bool) -> None: ...
+
     def apply_enabled(self, enabled: bool) -> None: ...
     def start_recording(self, mode: RecordingMode = RecordingMode.STREAM) -> None: ...
     async def stop_recording(self) -> None: ...
@@ -625,6 +633,12 @@ class VibeApp(App):  # noqa: PLR0904
             "ctrl+g", "open_plan_in_editor", "Edit Plan", show=False, priority=False
         ),
         Binding("ctrl+backslash", "toggle_debug_console", "Debug Console", show=False),
+        # priority=True so this reaches the App before the focused chat text
+        # area — which otherwise swallows every key while a voice recording
+        # is in flight (see ChatTextArea._handle_voice_key) — and before
+        # ctrl+t reaches TextArea's own key handling. check_action() below
+        # keeps it a true no-op (not just silent) whenever voice mode is off.
+        Binding("ctrl+t", "toggle_mute", "Toggle Mute", show=False, priority=True),
     ]
 
     _greeting_message: GreetingMessage | None = None
@@ -4640,12 +4654,26 @@ class VibeApp(App):  # noqa: PLR0904
             and screen_id.startswith("config-")
         ):
             return False
+        if action == "toggle_mute" and not self._voice_manager.is_enabled:
+            return False
         return True
 
     def action_interrupt(self) -> None:
         if self._app_server is None:
             return
         self._try_interrupt()
+
+    def action_toggle_mute(self) -> None:
+        # Global mute toggle for voice mode's mic input; a no-op while voice
+        # mode is off (also gated via check_action above). This only affects
+        # capture — playback is untouched. `muted` is the single flag a later
+        # duplex-voice pipeline will read to decide whether to suppress mic
+        # input; this action just flips it and plays the matching cue.
+        if not self._voice_manager.is_enabled:
+            return
+        muted = not self._voice_manager.muted
+        self._voice_manager.muted = muted
+        play_mute_cue(muted)
 
     async def on_history_load_more_requested(self, _: HistoryLoadMoreRequested) -> None:
         self._load_more.set_enabled(False)
