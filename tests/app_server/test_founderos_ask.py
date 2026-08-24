@@ -205,7 +205,7 @@ async def test_session_uses_stable_identity_and_existing_stream_event_path(
 
 
 @pytest.mark.asyncio
-async def test_work_class_and_model_are_omitted_unless_explicitly_passed(
+async def test_require_ack_and_model_are_omitted_unless_explicitly_passed(
     tmp_path: Path,
 ) -> None:
     """Both are opt-in kwargs added for vibe/workflows -- every other caller
@@ -218,7 +218,7 @@ async def test_work_class_and_model_are_omitted_unless_explicitly_passed(
         transport=transport, cwd=tmp_path, session_id="s1"
     )
     [_ async for _ in session.act("hi")]
-    assert "work_class" not in transport.payloads[0]
+    assert "require_ack" not in transport.payloads[0]
     assert "model" not in transport.payloads[0]
 
     transport2 = _FakeAskTransport([
@@ -227,8 +227,8 @@ async def test_work_class_and_model_are_omitted_unless_explicitly_passed(
     session2 = FounderOSAskSession(
         transport=transport2, cwd=tmp_path, session_id="s2"
     )
-    [_ async for _ in session2.act("hi", work_class="chat", model="gpt-5-mini")]
-    assert transport2.payloads[0]["work_class"] == "chat"
+    [_ async for _ in session2.act("hi", require_ack=True, model="gpt-5-mini")]
+    assert transport2.payloads[0]["require_ack"] is True
     assert transport2.payloads[0]["model"] == "gpt-5-mini"
 
 

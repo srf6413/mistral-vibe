@@ -198,27 +198,34 @@ async def test_session_id_opt_overrides_the_default_frontend_session_id(
 
 
 @pytest.mark.asyncio
-async def test_every_call_declares_chat_work_class_and_an_explicit_model(
+async def test_every_call_declares_require_ack_and_an_explicit_model(
     fake_session_factory,
 ) -> None:
     """Compute Budget (ask-compute-budget-dispatch-v1) treats every /ask turn
-    as real dispatchable work by default -- work_class="chat" plus a real
+    as real dispatchable work by default -- require_ack=True plus a real
     model on every request is what keeps a workflow review turn from coming
     back as a backgrounded engine dispatch or a "Parked /ask" stub instead of
     text. This must hold with no opts at all, not just when opted in.
+
+    work_class="chat" (tried first) is deliberately NOT used: it narrows the
+    provider catalog to the single never-auto manus_delegate candidate, and
+    when that isn't reachable the server can't resolve any provider at all
+    and refuses to even start the ARC run -- confirmed against the live dev
+    tip, not just read from source. require_ack leaves the catalog alone.
     """
     session_factory, transports = fake_session_factory([FakeAskTransport.ok("ack")])
 
     await call_agent("hi", opts={}, session_factory=session_factory)
 
     payload = transports[0].payloads[0]
-    assert payload["work_class"] == "chat"
+    assert payload["require_ack"] is True
+    assert "work_class" not in payload
     assert payload["model"]
     assert payload["model"] != "auto"
 
 
 @pytest.mark.asyncio
-async def test_model_opt_overrides_the_default_model_but_not_work_class(
+async def test_model_opt_overrides_the_default_model_but_not_require_ack(
     fake_session_factory,
 ) -> None:
     session_factory, transports = fake_session_factory([FakeAskTransport.ok("ack")])
@@ -229,7 +236,7 @@ async def test_model_opt_overrides_the_default_model_but_not_work_class(
 
     payload = transports[0].payloads[0]
     assert payload["model"] == "gpt-5-codex"
-    assert payload["work_class"] == "chat"
+    assert payload["require_ack"] is True
 
 
 # -- opts: schema (best-effort structured output) ----------------------

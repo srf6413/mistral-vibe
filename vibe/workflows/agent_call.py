@@ -58,20 +58,27 @@ _DECIDE_DONT_ASK_PREAMBLE = (
     "final answer within this turn.\n\n"
 )
 
-# Every workflow turn declares work_class="chat" so Compute Budget's engine
-# router (decision_ref ask-compute-budget-dispatch-v1) never treats a review
-# prompt as real dispatchable work: the only catalog entry competent for
-# "chat" (manus_delegate) is never-auto, so the gate falls through to
-# founder_paste instead of backgrounding a real grok_remote/codex_remote run.
-# See modules/ask_compute_dispatch.py (default_provider_candidates, work_class
-# catalogs) and modules/compute_budget.py (resolve_engine_forward) on the
-# FounderOS server for the authoritative routing logic this relies on.
-_WORKFLOW_WORK_CLASS = "chat"
+# Every workflow turn sends require_ack=True so Compute Budget's engine router
+# (decision_ref ask-compute-budget-dispatch-v1) never treats a review prompt as
+# real dispatchable work: require_ack trips is_founder_bound_work() -> gate
+# action "human_surface" instead of "direct_forward", without narrowing the
+# provider catalog (unlike work_class="chat", which was tried first and
+# rejected -- see below). See modules/compute_budget.py
+# (is_founder_bound_work, resolve_engine_forward) on the FounderOS server for
+# the authoritative routing logic this relies on.
+#
+# work_class="chat" does NOT work for this: it narrows the catalog to the
+# single never-auto manus_delegate candidate, and when that isn't reachable
+# decide_provider_route() resolves no provider at all, so the /ask server
+# raises ("requires a resolved Compute Budget provider") before the gate is
+# ever reached -- confirmed empirically against the live dev tip, not just
+# read from source.
+_WORKFLOW_REQUIRE_ACK = True
 
 # An explicit model bypasses the frontend_session_id-driven prefer_fast->easy
 # (haiku) auto-select in _resolve_ask_models on the server -- without this,
-# work_class="chat" alone can still land on a "Parked /ask" stub instead of
-# real text, because the haiku check is independent of work_class. This is
+# require_ack=True alone can still land on a "Parked /ask" stub instead of
+# real text, because the haiku check is independent of gate_action. This is
 # the server's own FOUNDEROS_CHAT_MODEL_FALLBACK default (ask_models.py), not
 # an invented value -- a real, already-used model on this deployment.
 _WORKFLOW_DEFAULT_MODEL = "gpt-5-mini"
@@ -130,7 +137,7 @@ async def _run_turn(
     session: FounderOSAskSession,
     message: str,
     *,
-    work_class: str | None = None,
+    require_ack: bool | None = None,
     model: str | None = None,
 ) -> str | None:
     """Drive one full `session.act(message)` turn to completion and return
@@ -138,7 +145,7 @@ async def _run_turn(
     `FounderOSAskStreamError` if a turn ends with no assistant text at
     all, so `None` here is defensive, not an expected path).
 
-    `work_class`/`model` pass straight through to `session.act(...)` -- see
+    `require_ack`/`model` pass straight through to `session.act(...)` -- see
     that method's docstring for why a workflow call needs both: Compute
     Budget (decision_ref ask-compute-budget-dispatch-v1) treats every /ask
     turn as real dispatchable work by default, which would background a
@@ -158,7 +165,7 @@ async def _run_turn(
     """
     text: str | None = None
     async with contextlib.aclosing(
-        session.act(message, work_class=work_class, model=model)
+        session.act(message, require_ack=require_ack, model=model)
     ) as events:
         async for event in events:
             text = _last_assistant_text(text, event)
@@ -203,15 +210,16 @@ async def call_agent(
       `_WORKFLOW_DEFAULT_MODEL` on the `/ask` request itself -- distinct
       from `pins`, which the server does not consult for the Compute
       Budget model-resolution gate this exists to avoid; see
-      `_WORKFLOW_WORK_CLASS/_WORKFLOW_DEFAULT_MODEL` above).
-    - Every call sends `work_class="chat"` and an explicit `model`
+      `_WORKFLOW_REQUIRE_ACK`/`_WORKFLOW_DEFAULT_MODEL` above).
+    - Every call sends `require_ack=True` and an explicit `model`
       (`opts["model"]` or `_WORKFLOW_DEFAULT_MODEL`) on the underlying
       `/ask` request, unconditionally -- not opt-in per call. Both exist
       to stop the FounderOS `/ask` server's Compute Budget engine router
       from treating a workflow review turn as real dispatchable work (see
-      `_WORKFLOW_WORK_CLASS` above for the full mechanism). Without this,
-      a workflow prompt can come back as a background-dispatch receipt or
-      a "Parked /ask" stub instead of text.
+      `_WORKFLOW_REQUIRE_ACK` above for the full mechanism, including why
+      `work_class="chat"` was tried first and rejected). Without this, a
+      workflow prompt can come back as a background-dispatch receipt or a
+      "Parked /ask" stub instead of text.
 
     Structured-output limitation: this client boundary has no tool-forced
     JSON mode. When `opts["schema"]` (a JSON Schema dict) is given, the
@@ -255,7 +263,10 @@ async def call_agent(
 
         async def run() -> AgentCallResult:
             text = await _run_turn(
-                session, message, work_class=_WORKFLOW_WORK_CLASS, model=call_model
+                session,
+                message,
+                require_ack=_WORKFLOW_REQUIRE_ACK,
+                model=call_model,
             )
 
             if schema is not None and text is not None:
@@ -271,7 +282,7 @@ async def call_agent(
                     text = await _run_turn(
                         session,
                         reask,
-                        work_class=_WORKFLOW_WORK_CLASS,
+                        require_ack=_WORKFLOW_REQUIRE_ACK,
                         model=call_model,
                     )
 
