@@ -11,7 +11,7 @@ Public surface, re-exported here so lanes import from one place:
         load_workflow_script, compile_workflow_main, build_restricted_globals,
         LoadedWorkflowScript, WorkflowScriptError,
         RunPaths, RunSummary, RunDetail, RunStatus,
-        list_runs, show_run, resume_run, skip_run, cancel_run,
+        list_runs, show_run, resume_run, skip_run, cancel_run, replay_events,
         HEARTBEAT_INTERVAL_S, HEARTBEAT_STALE_AFTER_S,
     )
 
@@ -47,6 +47,7 @@ from vibe.workflows.run_manager import (
     create_run,
     execute_run,
     list_runs,
+    replay_events,
     resume_run,
     show_run,
     skip_run,
@@ -90,6 +91,7 @@ __all__ = [
     "execute_run",
     "list_runs",
     "load_workflow_script",
+    "replay_events",
     "resume_run",
     "show_run",
     "skip_run",

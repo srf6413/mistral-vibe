@@ -112,11 +112,10 @@ on `_resume_cache_by_position` and this lane's integration report.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-import itertools
 import json
 import os
 from pathlib import Path
@@ -474,6 +473,24 @@ def _phase_id_for_call(journal_path: Path, call_id: str) -> str | None:
     return phase_id
 
 
+def _skipped_positions_from_journal(journal_path: Path) -> frozenset[int]:
+    """Fold a prior journal into the set of call positions permanently
+    skipped by an operator (`skip_run`), for `execute_run` to hand
+    `WorkflowRuntime(skipped_positions=...)` so a resume actually honors a
+    skip instead of re-issuing the call -- see `skip_run`'s docstring for
+    the gap this closes.
+    """
+    latest_by_call: dict[str, dict[str, Any]] = {}
+    for record in _read_journal_records(journal_path):
+        if record.get("kind") == "call" and record.get("call_id"):
+            latest_by_call[record["call_id"]] = record
+    return frozenset(
+        _position_of(call_id)
+        for call_id, record in latest_by_call.items()
+        if record.get("state") == "skipped"
+    )
+
+
 def _resume_cache_by_position(journal_path: Path) -> dict[int, str]:
     """Fold a prior journal into `{call position: cached final text}` for
     every call whose latest recorded state is `"ok"`/`"cached"`. See the
@@ -517,6 +534,128 @@ class _CachedAskTransport:
 
     async def close(self) -> None:
         return None
+
+
+class _RunExecutionHooks:
+    """The `session_factory`/`emit` pair `execute_run` wires into one
+    `WorkflowRuntime`, plus the runtime-log-draining glue -- split into its
+    own class only to keep `execute_run` itself under this repo's ruff
+    statement/local-variable caps; behavior is unchanged from having these
+    as closures defined inline (see git history for that version).
+
+    `SessionFactory` is zero-arg (frozen by `agent_call.py`'s contract), so
+    it has no direct way to know which call position it is being invoked
+    for. A plain invocation-count `itertools.count()` (this class's
+    original approach, before this refactor) is WRONG once any call in the
+    run can be skipped (see `WorkflowRuntime.agent()`'s `skipped_positions`
+    check) or budget-cut: those calls mint a call-id and emit `"running"`
+    but never call `session_factory`, so a bare invocation counter drifts
+    out of sync with the true call position for every call after the first
+    gap. Instead, `emit` -- which fires an `AgentCallEvent(state="running")`
+    synchronously, in call-id order, for EVERY call including ones about to
+    be skipped/cut, strictly before `WorkflowRuntime.agent()` can reach
+    `session_factory` for that same call and with no `await` in between --
+    stashes the position on `self` for `session_factory` to read. A stale
+    leftover from a skipped/cut call is harmless: it is always overwritten
+    by the next call's own `"running"` emission before that call's own
+    (if any) `session_factory` invocation.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        cwd: Path,
+        journal: JournalWriter,
+        resume_texts: dict[int, str],
+        resolved_endpoint: str | None,
+        resolved_workspace: str | None,
+        extra_emit: Callable[[WorkflowEvent], None] | None,
+        extra_log: Callable[[str, str], None] | None,
+    ) -> None:
+        self._run_id = run_id
+        self._cwd = cwd
+        self._journal = journal
+        self._resume_texts = resume_texts
+        self._resolved_endpoint = resolved_endpoint
+        self._resolved_workspace = resolved_workspace
+        self._extra_emit = extra_emit
+        self._extra_log = extra_log
+        self.cached_positions: set[int] = set()
+        self._pending_call_position: int | None = None
+        # Bound after `WorkflowRuntime.__init__` returns, since the runtime
+        # needs `self.emit` before it exists -- see `bind_runtime`.
+        self._runtime: WorkflowRuntime | None = None
+        self._drained_log_count = 0
+
+    def bind_runtime(self, runtime: WorkflowRuntime) -> None:
+        self._runtime = runtime
+
+    def session_factory(self) -> FounderOSAskSession:
+        n = self._pending_call_position
+        if n is None:  # pragma: no cover - defensive; see class docstring
+            raise RuntimeError(
+                "session_factory invoked with no known call position -- "
+                "expected an AgentCallEvent(state='running') to have fired "
+                "first"
+            )
+        cached_text = self._resume_texts.get(n)
+        transport: AskTransport
+        if cached_text is not None:
+            self.cached_positions.add(n)
+            transport = _CachedAskTransport(cached_text)
+        else:
+            transport = HttpFounderOSAskTransport(
+                endpoint=self._resolved_endpoint
+                or os.environ.get("FOUNDEROS_ASK_URL", DEFAULT_FOUNDEROS_ASK_URL),
+                workspace=self._resolved_workspace
+                or os.environ.get("FOUNDEROS_WORKSPACE", DEFAULT_FOUNDEROS_WORKSPACE),
+                api_key=os.environ.get("FOUNDEROS_API_KEY"),
+            )
+        return FounderOSAskSession(
+            transport=transport, cwd=self._cwd, session_id=f"wf-{self._run_id}-call-{n}"
+        )
+
+    def drain_logs(self) -> None:
+        """Flush any `wf.log(...)` records not yet persisted into the
+        journal (and `extra_log`, if given). Called after every
+        `PhaseEvent`/`AgentCallEvent` (via `emit`) and once more after
+        `main()` returns/raises, so no trailing `wf.log()` call issued
+        after the last event is ever lost -- see `WorkflowRuntime.log()`'s
+        docstring for why `wf.log()` cannot go through `emit` itself.
+        """
+        if self._runtime is None:
+            return
+        records = self._runtime.log_records
+        while self._drained_log_count < len(records):
+            record = records[self._drained_log_count]
+            level = record.get("level") or "info"
+            message = record.get("message") or ""
+            self._journal.log(message, level=level)
+            if self._extra_log is not None:
+                self._extra_log(level, message)
+            self._drained_log_count += 1
+
+    def emit(self, event: WorkflowEvent) -> None:
+        """Wired as `WorkflowRuntime(emit=...)`. Writes the journal record,
+        fans the event out to `extra_emit` (if given) -- with the SAME
+        `"cached"` rewrite the journal record gets, so a live viewer and a
+        journal-replay viewer show identical state for a resumed call --
+        and drains any log lines the workflow issued since the last event.
+        """
+        if isinstance(event, AgentCallEvent) and event.state == "running":
+            self._pending_call_position = _position_of(event.call_id)
+        effective_event = event
+        if (
+            isinstance(event, AgentCallEvent)
+            and event.state == "ok"
+            and _position_of(event.call_id) in self.cached_positions
+        ):
+            effective_event = replace(event, state="cached")
+        self._journal.write_event(event, cached_positions=self.cached_positions)
+        if self._extra_emit is not None:
+            self._extra_emit(effective_event)
+        self.drain_logs()
 
 
 # -- run creation and execution ----------------------------------------------
@@ -575,6 +714,8 @@ async def execute_run(
     runs_root: Path = DEFAULT_RUNS_ROOT,
     endpoint: str | None = None,
     workspace: str | None = None,
+    extra_emit: Callable[[WorkflowEvent], None] | None = None,
+    extra_log: Callable[[str, str], None] | None = None,
 ) -> None:
     """Execute (or resume) `run_id`'s workflow to completion.
 
@@ -586,6 +727,24 @@ async def execute_run(
     failure or cancellation, so a run's owning process always leaves a
     terminal record unless it is killed outright (the case the liveness
     oracle's `"lost"` status exists for).
+
+    `extra_emit`/`extra_log`, if given, are called with every
+    `PhaseEvent`/`AgentCallEvent` and every `wf.log(...)` line this run
+    produces, in addition to (never instead of) the journal write -- this
+    is the hook a same-process caller (the CLI's `/workflows run`, wiring a
+    live `WorkflowProgressScreen`) uses to fan events out live, since the
+    journal itself is not something a UI widget should poll/tail. An
+    `AgentCallEvent` handed to `extra_emit` reflects the SAME `"cached"`
+    rewrite the journal record gets (see `JournalWriter.write_event`) so a
+    live viewer and a journal-replay viewer show identical state for a
+    resumed call.
+
+    `runtime.log_records` (see `vibe/workflows/runtime.py`'s `WorkflowRuntime.log()`
+    docstring -- `wf.log()` cannot go through `emit`, since the frozen
+    `WorkflowEvent` union has no log variant) is drained into the journal
+    -- and `extra_log`, if given -- every time a `PhaseEvent`/`AgentCallEvent`
+    fires, plus once more after `main()` returns/raises, so no trailing
+    `wf.log()` call issued after the last event is ever lost.
 
     Not part of the frozen stub surface -- see the module's "RUN CREATION /
     EXECUTION" note for why this lives here. `resume_run` is a thin
@@ -603,31 +762,17 @@ async def execute_run(
     resolved_workspace = workspace or meta_doc.get("workspace")
 
     journal = JournalWriter(paths.journal_path, run_id=run_id)
-    resume_texts = _resume_cache_by_position(paths.journal_path)
-    cached_positions: set[int] = set()
-    position_counter = itertools.count()
-
-    def session_factory() -> FounderOSAskSession:
-        n = next(position_counter)
-        cached_text = resume_texts.get(n)
-        transport: AskTransport
-        if cached_text is not None:
-            cached_positions.add(n)
-            transport = _CachedAskTransport(cached_text)
-        else:
-            transport = HttpFounderOSAskTransport(
-                endpoint=resolved_endpoint
-                or os.environ.get("FOUNDEROS_ASK_URL", DEFAULT_FOUNDEROS_ASK_URL),
-                workspace=resolved_workspace
-                or os.environ.get("FOUNDEROS_WORKSPACE", DEFAULT_FOUNDEROS_WORKSPACE),
-                api_key=os.environ.get("FOUNDEROS_API_KEY"),
-            )
-        return FounderOSAskSession(
-            transport=transport, cwd=cwd, session_id=f"wf-{run_id}-call-{n}"
-        )
-
-    def emit(event: WorkflowEvent) -> None:
-        journal.write_event(event, cached_positions=cached_positions)
+    hooks = _RunExecutionHooks(
+        run_id=run_id,
+        cwd=cwd,
+        journal=journal,
+        resume_texts=_resume_cache_by_position(paths.journal_path),
+        resolved_endpoint=resolved_endpoint,
+        resolved_workspace=resolved_workspace,
+        extra_emit=extra_emit,
+        extra_log=extra_log,
+    )
+    skipped_positions = _skipped_positions_from_journal(paths.journal_path)
 
     # A terminal "running" record (and the heartbeat loop) must exist before
     # anything else that can fail -- compiling the script, constructing the
@@ -640,17 +785,27 @@ async def execute_run(
         globals_dict = build_restricted_globals()
         main = compile_workflow_main(loaded, globals_dict)
         runtime = WorkflowRuntime(
-            run_id=run_id, meta=loaded.meta, session_factory=session_factory, emit=emit
+            run_id=run_id,
+            meta=loaded.meta,
+            session_factory=hooks.session_factory,
+            emit=hooks.emit,
+            skipped_positions=skipped_positions,
         )
+        hooks.bind_runtime(runtime)
         await main(runtime, args)
     except asyncio.CancelledError:
+        hooks.drain_logs()
         journal.write_run_status("cancelled")
         raise
     except Exception as exc:
+        hooks.drain_logs()
         journal.log(f"workflow run failed: {exc}", level="error")
+        if extra_log is not None:
+            extra_log("error", f"workflow run failed: {exc}")
         journal.write_run_status("failed")
         raise
     else:
+        hooks.drain_logs()
         journal.write_run_status("completed")
     finally:
         heartbeat_task.cancel()
@@ -725,7 +880,79 @@ def show_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> RunDetail:
     )
 
 
-async def resume_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> None:
+def replay_events(
+    run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT
+) -> tuple[list[WorkflowEvent], list[tuple[str, str]]]:
+    """Convert one run's journal into `(events, log_lines)` for a freshly
+    mounted `WorkflowProgressScreen`'s buffered-history args -- the
+    `/workflows show <run_id>` reattach path, or attaching to a run this
+    process did not itself launch.
+
+    Records are replayed in journal (`seq`) order, the same order a live
+    `WorkflowRuntime(emit=...)` would have produced them in --
+    `WorkflowProgressState.apply()` (the screen's reducer) is documented as
+    idempotent per node ("last write wins"), so replaying the full history
+    and then switching to live events reproduces identical final state
+    either way.
+
+    `skip_run` writes a `kind: "call"` record with `label=None` (it has no
+    `AgentCallEvent` to carry a label). `AgentCallEvent.label` is a
+    required `str` the tree renders directly, so a `None` label here would
+    either crash the dataclass or blank out a node that previously had a
+    real label -- this falls back to the call's most recently seen label,
+    or the bare `call_id` if none was ever recorded.
+    """
+    paths = RunPaths.for_run(run_id, runs_root=runs_root)
+    records = _read_journal_records(paths.journal_path)
+    events: list[WorkflowEvent] = []
+    log_lines: list[tuple[str, str]] = []
+    last_label_by_call: dict[str, str] = {}
+    for record in records:
+        kind = record.get("kind")
+        if kind == "phase":
+            events.append(
+                PhaseEvent(
+                    run_id=run_id,
+                    phase_id=record["phase_id"],
+                    title=record.get("label") or record["phase_id"],
+                    detail=record.get("detail") or "",
+                    state=record["state"],
+                )
+            )
+        elif kind == "call":
+            call_id = record["call_id"]
+            label = record.get("label")
+            if label:
+                last_label_by_call[call_id] = label
+            else:
+                label = last_label_by_call.get(call_id, call_id)
+            events.append(
+                AgentCallEvent(
+                    run_id=run_id,
+                    phase_id=record.get("phase_id") or "",
+                    call_id=call_id,
+                    label=label,
+                    state=record["state"],
+                    text=record.get("text"),
+                    reason=record.get("reason"),
+                    parent_call_id=record.get("parent_call_id"),
+                )
+            )
+        elif kind == "log":
+            log_lines.append((
+                record.get("level") or "info",
+                record.get("message") or "",
+            ))
+    return events, log_lines
+
+
+async def resume_run(
+    run_id: str,
+    *,
+    runs_root: Path = DEFAULT_RUNS_ROOT,
+    extra_emit: Callable[[WorkflowEvent], None] | None = None,
+    extra_log: Callable[[str, str], None] | None = None,
+) -> None:
     """Re-attach to `run_id` and continue it from its last journal record.
 
     Only valid when `show_run(run_id).status in {"lost", "failed"}` (a
@@ -734,6 +961,10 @@ async def resume_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> Non
     `phase-{n}` ids from the journal so already-`"ok"` calls are not
     re-issued -- this is the reason `vibe/workflows/events.py` freezes
     deterministic id-minting from call order alone.
+
+    `extra_emit`/`extra_log` are forwarded unchanged to `execute_run` (see
+    its docstring) -- a resumed run gets the same live-fan-out hook a fresh
+    run does.
     """
     detail = show_run(run_id, runs_root=runs_root)
     if detail.status not in {"lost", "failed"}:
@@ -741,7 +972,9 @@ async def resume_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> Non
             f"run {run_id!r} is {detail.status!r}; only a 'lost' or 'failed' "
             "run can be resumed"
         )
-    await execute_run(run_id, runs_root=runs_root)
+    await execute_run(
+        run_id, runs_root=runs_root, extra_emit=extra_emit, extra_log=extra_log
+    )
 
 
 async def skip_run(
@@ -753,15 +986,14 @@ async def skip_run(
     retried; appends a `kind: "call"`, `state: "skipped"` record so the
     next `resume_run` treats it as already terminal.
 
-    KNOWN GAP (see the module's "RESUME CACHING" note): this correctly
-    records the skip in the journal, so `show_run`/`list_runs` immediately
-    reflect it. But `execute_run`'s resume cache only short-circuits calls
-    whose last state was `"ok"`/`"cached"` (it has no way to synthesize an
-    `AgentCallResult(status="skipped", ...)` without a hook inside
-    `WorkflowRuntime.agent()`, which this lane does not own) -- a
-    subsequent `resume_run` will therefore still *re-issue* a skipped call
-    rather than honoring the skip during execution. Flagged for
-    integration; see this lane's report.
+    Honored on resume: `execute_run` folds every `"skipped"`-latest-state
+    call position out of the journal (`_skipped_positions_from_journal`)
+    and hands it to `WorkflowRuntime(skipped_positions=...)`, which
+    short-circuits that call-id position to a `"skipped"` result before it
+    ever reaches `agent_call.call_agent` -- no network call, no budget
+    spend. (This closes the gap the `run_manager` lane's own report
+    flagged: skip used to only update the journal display, never actually
+    prevent a re-issue on resume.)
     """
     paths = RunPaths.for_run(run_id, runs_root=runs_root)
     if not paths.meta_path.exists():

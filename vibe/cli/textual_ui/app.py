@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
@@ -272,12 +272,15 @@ from vibe.utils.session_id import shorten_session_id
 from vibe.workflows import (
     DEFAULT_RUNS_ROOT,
     RunPaths,
+    RunStatus,
     RunSummary,
+    WorkflowEvent,
     WorkflowScriptError,
     cancel_run,
     create_run,
     execute_run,
     list_runs,
+    replay_events,
     resume_run,
     show_run,
     skip_run,
@@ -616,6 +619,68 @@ def _noop_narrator_manager() -> NarratorManagerPort:
     return cast(NarratorManagerPort, _IdleNarratorManager())
 
 
+class _WorkflowRunBus:
+    """In-process live event/log fan-out for one locally-owned workflow run.
+
+    Bridges a `WorkflowRuntime(emit=...)` still executing in this process
+    (via `execute_run`'s `extra_emit`/`extra_log` hooks -- see
+    `vibe/workflows/run_manager.py`) to a `WorkflowProgressScreen`'s
+    `events`/`log_lines` (buffered) + `subscribe_events`/`subscribe_logs`
+    (live) constructor args.
+
+    `subscribe_events`/`subscribe_logs` deliver the buffered backlog to the
+    new handler SYNCHRONOUSLY, before registering it for live updates, all
+    within the one call -- this closes what would otherwise be a
+    dropped-event window: `WorkflowProgressScreen.on_mount` (where it
+    subscribes) runs after `push_screen` and after whatever `await`s
+    happened between the workflow task starting and the screen actually
+    mounting, during which the workflow can already have emitted events. A
+    two-step "hand me `events=`, then separately call `subscribe`" API
+    would lose whatever landed in that gap; one call that replays-then-
+    subscribes cannot.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[WorkflowEvent] = []
+        self._log_lines: list[tuple[str, str]] = []
+        self._event_subscribers: list[Callable[[WorkflowEvent], None]] = []
+        self._log_subscribers: list[Callable[[str, str], None]] = []
+
+    def publish_event(self, event: WorkflowEvent) -> None:
+        self._events.append(event)
+        for handler in list(self._event_subscribers):
+            handler(event)
+
+    def publish_log(self, level: str, message: str) -> None:
+        self._log_lines.append((level, message))
+        for handler in list(self._log_subscribers):
+            handler(level, message)
+
+    def subscribe_events(
+        self, handler: Callable[[WorkflowEvent], None]
+    ) -> Callable[[], None]:
+        for event in self._events:
+            handler(event)
+        self._event_subscribers.append(handler)
+
+        def _unsubscribe() -> None:
+            with suppress(ValueError):
+                self._event_subscribers.remove(handler)
+
+        return _unsubscribe
+
+    def subscribe_logs(self, handler: Callable[[str, str], None]) -> Callable[[], None]:
+        for level, message in self._log_lines:
+            handler(level, message)
+        self._log_subscribers.append(handler)
+
+        def _unsubscribe() -> None:
+            with suppress(ValueError):
+                self._log_subscribers.remove(handler)
+
+        return _unsubscribe
+
+
 def _format_run_list(summaries: list[RunSummary]) -> str:
     if not summaries:
         return "No workflow runs."
@@ -714,6 +779,11 @@ class VibeApp(App):  # noqa: PLR0904
         # the main chat turn. Each `/workflows run`/`resume` gets its own
         # `asyncio.Task` here so a running workflow never blocks chat.
         self._workflow_tasks: dict[str, asyncio.Task[None]] = {}
+        # One `_WorkflowRunBus` per run this session itself launched/resumed
+        # (never for a run only *observed* via `/workflows show`) -- lets a
+        # `WorkflowProgressScreen` subscribe to a `WorkflowRuntime` still
+        # executing in this same process. See `_WorkflowRunBus`.
+        self._workflow_buses: dict[str, _WorkflowRunBus] = {}
         self._init_controllers()
 
         self._loading_widget: LoadingWidget | None = None
@@ -4061,6 +4131,11 @@ class VibeApp(App):  # noqa: PLR0904
                 f"- phases:\n{phases}"
             )
         )
+        # Reattach: this is the "Esc detached the progress screen, now
+        # `/workflows show <run_id>` to get it back" path -- replays full
+        # journal history and, if this session is still the one driving the
+        # run, resubscribes to its live feed too. See `_push_workflow_screen`.
+        await self._push_workflow_screen(run_id)
 
     async def _workflows_resume(self, rest: str) -> None:
         run_id = rest.strip()
@@ -4124,24 +4199,41 @@ class VibeApp(App):  # noqa: PLR0904
         )
 
     def _launch_workflow_task(self, run_id: str, *, resume: bool) -> None:
-        task = asyncio.create_task(self._run_workflow_task(run_id, resume=resume))
+        bus = self._workflow_buses.setdefault(run_id, _WorkflowRunBus())
+        task = asyncio.create_task(
+            self._run_workflow_task(run_id, resume=resume, bus=bus)
+        )
         self._workflow_tasks[run_id] = task
 
-    async def _run_workflow_task(self, run_id: str, *, resume: bool) -> None:
+    async def _run_workflow_task(
+        self, run_id: str, *, resume: bool, bus: _WorkflowRunBus
+    ) -> None:
         """Drive one workflow run to completion off the main chat task.
 
         Never touches `self._agent_task` (reserved for the main chat turn);
         always leaves a notice in the transcript on completion, failure, or
         cancellation, per the founder-visible requirement that a workflow's
         outcome lands in chat even if nobody was watching the workflow
-        screen.
+        screen. `bus` fans this run's live events/logs out to any mounted
+        `WorkflowProgressScreen` -- see `_WorkflowRunBus` and
+        `_push_workflow_screen`.
         """
         run_dir = RunPaths.for_run(run_id, runs_root=DEFAULT_RUNS_ROOT).root
         try:
             if resume:
-                await resume_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+                await resume_run(
+                    run_id,
+                    runs_root=DEFAULT_RUNS_ROOT,
+                    extra_emit=bus.publish_event,
+                    extra_log=bus.publish_log,
+                )
             else:
-                await execute_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+                await execute_run(
+                    run_id,
+                    runs_root=DEFAULT_RUNS_ROOT,
+                    extra_emit=bus.publish_event,
+                    extra_log=bus.publish_log,
+                )
         except asyncio.CancelledError:
             self._workflow_tasks.pop(run_id, None)
             await self._mount_and_scroll(
@@ -4164,19 +4256,88 @@ class VibeApp(App):  # noqa: PLR0904
         )
 
     async def _push_workflow_screen(self, run_id: str) -> None:
-        """Best-effort: the live progress-tree screen is owned by a
-        different lane and may not exist in every build of this app. A
-        workflow still runs to completion (and still lands a transcript
-        notice) with or without it -- see this lane's integration report.
+        """Push the live progress-tree screen for `run_id`.
+
+        Best-effort: `WorkflowProgressScreen` lives in a separate package
+        (`vibe.cli.textual_ui.screens.workflow`) that a minimal build of
+        this app need not include, so a missing import still lets the
+        workflow run to completion (and still lands a transcript notice)
+        without it.
+
+        Two attachment shapes, depending on whether THIS session is the
+        one driving `run_id` (`run_id in self._workflow_buses` --
+        `/workflows run` or `/workflows resume` launched it just above):
+        - locally owned: live `subscribe_events`/`subscribe_logs` wired to
+          the run's `_WorkflowRunBus`, so the tree updates as the workflow
+          actually executes.
+        - observed only (e.g. `/workflows show <run_id>` reattaching to a
+          run this process did not launch, possibly from another process
+          entirely): no live feed, just `events`/`log_lines` replayed from
+          the journal via `replay_events` -- still shows full history, just
+          frozen at the moment the screen was opened aside from the
+          `get_run_status` liveness poll below.
         """
         try:
-            from vibe.cli.textual_ui.widgets.workflow_screen import (  # type: ignore[import-not-found]
-                WorkflowScreen,
+            from vibe.cli.textual_ui.screens.workflow.workflow_screen import (
+                WorkflowProgressScreen,
             )
         except ImportError:
             return
+        try:
+            detail = show_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+        except FileNotFoundError:
+            return
+
+        bus = self._workflow_buses.get(run_id)
+        events: Sequence[WorkflowEvent] = ()
+        log_lines: Sequence[tuple[str, str]] = ()
+        subscribe_events = None
+        subscribe_logs = None
+        if bus is not None:
+            subscribe_events = bus.subscribe_events
+            subscribe_logs = bus.subscribe_logs
+        else:
+            events, log_lines = replay_events(run_id, runs_root=DEFAULT_RUNS_ROOT)
+
+        def get_run_status() -> RunStatus:
+            return show_run(run_id, runs_root=DEFAULT_RUNS_ROOT).status
+
+        async def on_skip(phase_id: str, call_id: str) -> None:
+            # `WorkflowProgressScreen` hands us `(phase_id, call_id)` (the
+            # `node_key` shape used everywhere else in this contract), but
+            # `skip_run`'s real signature is `(run_id, call_id)` -- phase
+            # scoping doesn't matter for a skip, so it's simply dropped
+            # here (flagged by the screen lane's own report as exactly
+            # this adapter's job).
+            del phase_id
+            await skip_run(run_id, call_id, runs_root=DEFAULT_RUNS_ROOT)
+
+        async def on_cancel() -> None:
+            local_task = self._workflow_tasks.get(run_id)
+            if local_task is not None and not local_task.done():
+                # We own the task in-process: cancel it directly and let
+                # `execute_run`'s own `except asyncio.CancelledError`
+                # handler write the terminal journal record -- calling
+                # `cancel_run` as well afterward would be safe but
+                # redundant (see its own docstring).
+                local_task.cancel()
+                return
+            await cancel_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+
         with suppress(NoScreen):
-            self.push_screen(WorkflowScreen(run_id=run_id))
+            self.push_screen(
+                WorkflowProgressScreen(
+                    run_id=run_id,
+                    meta=detail.meta,
+                    events=events,
+                    log_lines=log_lines,
+                    subscribe_events=subscribe_events,
+                    subscribe_logs=subscribe_logs,
+                    get_run_status=get_run_status,
+                    on_skip=on_skip,
+                    on_cancel=on_cancel,
+                )
+            )
 
     async def _compact_history(self, cmd_args: str = "", **kwargs: Any) -> None:
         if self._agent_job_active():

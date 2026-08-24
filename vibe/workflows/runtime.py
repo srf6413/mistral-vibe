@@ -209,6 +209,7 @@ class WorkflowRuntime:
         meta: WorkflowMeta,
         session_factory: SessionFactory,
         emit: Callable[[WorkflowEvent], None] | None = None,
+        skipped_positions: frozenset[int] = frozenset(),
     ) -> None:
         """`session_factory` is forwarded to every `call_agent(...)` this
         runtime issues (directly, or via `agent()`/`parallel()`/
@@ -222,6 +223,18 @@ class WorkflowRuntime:
         wrapping the same underlying calls) to render or persist. `emit`
         must not block the event loop for long -- it runs inline on the
         same task as the workflow step that produced the event.
+
+        `skipped_positions`, if given, is the set of call-id positions
+        (`call-{n}` -> `n`) that must never be issued to `agent_call`:
+        `agent()` mints the id and emits `"running"` -> `"skipped"` for a
+        position in this set without spending budget or opening a session.
+        Added by integration to close a gap the `run_manager` lane flagged
+        (an operator's `skip_run` was recorded in the journal but never
+        actually honored on `resume_run`, since nothing upstream of this
+        runtime could tell it "this position is permanently skipped");
+        `run_manager.execute_run` populates this from the prior journal
+        before constructing the runtime -- this runtime never reads the
+        journal itself.
 
         Raises `RuntimeError` if a `WorkflowRuntime` is constructed while
         another one already has an `agent()` call (or a script's `main`, via
@@ -240,6 +253,7 @@ class WorkflowRuntime:
         self.meta = meta
         self._session_factory = session_factory
         self._emit = emit
+        self._skipped_positions = skipped_positions
         self._max_concurrency = _read_int_env(
             DEFAULT_MAX_CONCURRENCY_ENV, DEFAULT_MAX_CONCURRENCY
         )
@@ -316,6 +330,28 @@ class WorkflowRuntime:
                 parent_call_id=parent_call_id,
             )
         )
+
+        if self._next_call_index - 1 in self._skipped_positions:
+            # An operator marked this call-id position permanently skipped
+            # (`run_manager.skip_run`) before this run/resume started. Never
+            # issue it, never spend budget on it -- just emit the terminal
+            # "skipped" state so the UI/journal reflect the operator's
+            # decision instead of silently re-running a call they rejected.
+            result = AgentCallResult(
+                status="skipped", text=None, reason="skipped by operator"
+            )
+            self._emit_event(
+                AgentCallEvent(
+                    run_id=self.run_id,
+                    phase_id=phase_id,
+                    call_id=call_id,
+                    label=resolved_label,
+                    state=result.status,
+                    reason=result.reason,
+                    parent_call_id=parent_call_id,
+                )
+            )
+            return result
 
         if self._budget.exhausted():
             result = AgentCallResult(

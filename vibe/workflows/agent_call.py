@@ -113,10 +113,22 @@ async def _run_turn(session: FounderOSAskSession, message: str) -> str | None:
     the final assistant text seen (`act()` itself raises
     `FounderOSAskStreamError` if a turn ends with no assistant text at
     all, so `None` here is defensive, not an expected path).
+
+    Wrapped in `contextlib.aclosing` (not a bare `async for ... in
+    session.act(...)`) so the underlying async generator -- and the
+    transport stream it holds open -- is always closed, including when
+    this call is cancelled mid-turn (e.g. `opts["timeout_seconds"]`'s
+    `asyncio.wait_for`) rather than only on normal completion. Matches the
+    existing convention enforced repo-wide for every other `.act(...)`
+    consumer -- see `tests/agent_loop/test_agents.py`'s
+    `TestActConsumersUseAclosing` and `vibe/cli/programmatic.py`'s
+    `async with aclosing(session.act(prompt)) as events:` for the same
+    pattern.
     """
     text: str | None = None
-    async for event in session.act(message):
-        text = _last_assistant_text(text, event)
+    async with contextlib.aclosing(session.act(message)) as events:
+        async for event in events:
+            text = _last_assistant_text(text, event)
     return text
 
 
