@@ -36,6 +36,7 @@ from vibe.workflows.events import (
     WorkflowMeta,
 )
 from vibe.workflows.run_manager import (
+    DEFAULT_RUNS_ROOT,
     HEARTBEAT_INTERVAL_S,
     HEARTBEAT_STALE_AFTER_S,
     RunDetail,
@@ -43,6 +44,8 @@ from vibe.workflows.run_manager import (
     RunStatus,
     RunSummary,
     cancel_run,
+    create_run,
+    execute_run,
     list_runs,
     resume_run,
     show_run,
@@ -58,6 +61,7 @@ from vibe.workflows.script import (
 )
 
 __all__ = [
+    "DEFAULT_RUNS_ROOT",
     "HEARTBEAT_INTERVAL_S",
     "HEARTBEAT_STALE_AFTER_S",
     "AgentCallEvent",
@@ -82,6 +86,8 @@ __all__ = [
     "call_agent",
     "cancel_run",
     "compile_workflow_main",
+    "create_run",
+    "execute_run",
     "list_runs",
     "load_workflow_script",
     "resume_run",

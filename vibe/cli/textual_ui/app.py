@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum, auto
 from functools import partial
 import gc
+import json
 import os
 from pathlib import Path
 import signal
@@ -268,6 +269,19 @@ from vibe.utils.paths import is_dangerous_directory
 from vibe.utils.repository import repo_url_label
 from vibe.utils.retry_prompt import build_retry_prompt
 from vibe.utils.session_id import shorten_session_id
+from vibe.workflows import (
+    DEFAULT_RUNS_ROOT,
+    RunPaths,
+    RunSummary,
+    WorkflowScriptError,
+    cancel_run,
+    create_run,
+    execute_run,
+    list_runs,
+    resume_run,
+    show_run,
+    skip_run,
+)
 
 _VSCODE_FAMILY_TERMINALS = {Terminal.VSCODE, Terminal.VSCODE_INSIDERS, Terminal.CURSOR}
 
@@ -602,6 +616,18 @@ def _noop_narrator_manager() -> NarratorManagerPort:
     return cast(NarratorManagerPort, _IdleNarratorManager())
 
 
+def _format_run_list(summaries: list[RunSummary]) -> str:
+    if not summaries:
+        return "No workflow runs."
+    rows = ["| Run | Name | Status | Created |", "|-----|------|--------|---------|"]
+    for summary in summaries:
+        rows.append(
+            f"| `{summary.run_id}` | {summary.name} | {summary.status} | "
+            f"{summary.created_at} |"
+        )
+    return "\n".join(rows)
+
+
 _REJECT_HINT_BUSY = "wait for the current job to finish."
 _REJECT_HINT_PAUSED = "clear the queue first or remove this input."
 
@@ -649,7 +675,7 @@ class VibeApp(App):  # noqa: PLR0904
         patch_driver_parser()
         return driver_class
 
-    def __init__(
+    def __init__(  # noqa: PLR0915 - one more field for workflow-run tracking
         self,
         history_file: Path,
         app_server: AppServerSource,
@@ -684,6 +710,10 @@ class VibeApp(App):  # noqa: PLR0904
         self._interrupt_requested = False
         self._agent_task: asyncio.Task | None = None
         self._bash_task: asyncio.Task | None = None
+        # Workflow runs never use `self._agent_task` -- that's reserved for
+        # the main chat turn. Each `/workflows run`/`resume` gets its own
+        # `asyncio.Task` here so a running workflow never blocks chat.
+        self._workflow_tasks: dict[str, asyncio.Task[None]] = {}
         self._init_controllers()
 
         self._loading_widget: LoadingWidget | None = None
@@ -3906,6 +3936,247 @@ class VibeApp(App):  # noqa: PLR0904
     async def _loop_command(self, cmd_args: str = "", **kwargs: Any) -> None:
         widget = await self._loop_commands.handle_command(cmd_args)
         await self._mount_and_scroll(widget)
+
+    def _workflows_usage_error(self) -> ErrorMessage:
+        return ErrorMessage(
+            "Usage:\n"
+            "  /workflows run <path> [json-args]\n"
+            "  /workflows list\n"
+            "  /workflows show <run_id>\n"
+            "  /workflows resume <run_id>\n"
+            "  /workflows skip <run_id> <call_id>\n"
+            "  /workflows cancel <run_id>",
+            collapsed=self._tools_collapsed,
+        )
+
+    async def _workflows_command(self, cmd_args: str = "", **kwargs: Any) -> None:
+        args = (cmd_args or "").strip()
+        if not args:
+            await self._mount_and_scroll(self._workflows_usage_error())
+            return
+        verb, _, rest = args.partition(" ")
+        rest = rest.strip()
+        try:
+            if verb == "run":
+                await self._workflows_run(rest)
+            elif verb in {"list", "ls"}:
+                await self._workflows_list()
+            elif verb == "show":
+                await self._workflows_show(rest)
+            elif verb == "resume":
+                await self._workflows_resume(rest)
+            elif verb == "skip":
+                await self._workflows_skip(rest)
+            elif verb == "cancel":
+                await self._workflows_cancel(rest)
+            else:
+                await self._mount_and_scroll(self._workflows_usage_error())
+        except FileNotFoundError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(str(exc), collapsed=self._tools_collapsed)
+            )
+
+    async def _workflows_run(self, rest: str) -> None:
+        if not rest:
+            await self._mount_and_scroll(self._workflows_usage_error())
+            return
+        script_arg, _, args_json = rest.partition(" ")
+        args_json = args_json.strip()
+
+        script_path = Path(script_arg).expanduser()
+        if not script_path.is_absolute():
+            script_path = Path(self.app_server.cwd) / script_path
+
+        args: dict[str, Any] = {}
+        if args_json:
+            try:
+                parsed = json.loads(args_json)
+            except json.JSONDecodeError as exc:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Invalid JSON workflow args: {exc}",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            if not isinstance(parsed, dict):
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        "Workflow args must be a JSON object.",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            args = parsed
+
+        run_id = f"wf-{script_path.stem}-{uuid4().hex[:8]}"
+        try:
+            create_run(
+                run_id,
+                script_path,
+                args,
+                runs_root=DEFAULT_RUNS_ROOT,
+                cwd=Path(self.app_server.cwd),
+            )
+        except WorkflowScriptError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(str(exc), collapsed=self._tools_collapsed)
+            )
+            return
+        except OSError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Could not start workflow: {exc}", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        self._launch_workflow_task(run_id, resume=False)
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Started workflow `{run_id}` in the background -- chat stays "
+                f"usable while it runs. Run dir: "
+                f"`{RunPaths.for_run(run_id, runs_root=DEFAULT_RUNS_ROOT).root}`"
+            )
+        )
+        await self._push_workflow_screen(run_id)
+
+    async def _workflows_list(self) -> None:
+        summaries = list_runs(runs_root=DEFAULT_RUNS_ROOT)
+        await self._mount_and_scroll(UserCommandMessage(_format_run_list(summaries)))
+
+    async def _workflows_show(self, rest: str) -> None:
+        run_id = rest.strip()
+        if not run_id:
+            await self._mount_and_scroll(self._workflows_usage_error())
+            return
+        detail = show_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+        phases = "\n".join(f"  - {p.title}" for p in detail.meta.phases) or "  (none)"
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"## Workflow `{run_id}`\n\n"
+                f"- name: {detail.meta.name}\n"
+                f"- status: **{detail.status}**\n"
+                f"- run dir: `{detail.paths.root}`\n"
+                f"- phases:\n{phases}"
+            )
+        )
+
+    async def _workflows_resume(self, rest: str) -> None:
+        run_id = rest.strip()
+        if not run_id:
+            await self._mount_and_scroll(self._workflows_usage_error())
+            return
+        if run_id in self._workflow_tasks and not self._workflow_tasks[run_id].done():
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Workflow `{run_id}` is already running in this session.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        detail = show_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+        if detail.status not in {"lost", "failed"}:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Workflow `{run_id}` is {detail.status!r}; only a "
+                    "'lost' or 'failed' run can be resumed.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        self._launch_workflow_task(run_id, resume=True)
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Resumed workflow `{run_id}` in the background.")
+        )
+        await self._push_workflow_screen(run_id)
+
+    async def _workflows_skip(self, rest: str) -> None:
+        run_id, _, call_id = rest.partition(" ")
+        run_id, call_id = run_id.strip(), call_id.strip()
+        if not run_id or not call_id:
+            await self._mount_and_scroll(self._workflows_usage_error())
+            return
+        await skip_run(run_id, call_id, runs_root=DEFAULT_RUNS_ROOT)
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Marked `{call_id}` skipped on workflow `{run_id}` -- it will "
+                "not be re-issued on the next resume."
+            )
+        )
+
+    async def _workflows_cancel(self, rest: str) -> None:
+        run_id = rest.strip()
+        if not run_id:
+            await self._mount_and_scroll(self._workflows_usage_error())
+            return
+        local_task = self._workflow_tasks.get(run_id)
+        if local_task is not None and not local_task.done():
+            local_task.cancel()
+            await self._mount_and_scroll(
+                UserCommandMessage(f"Cancelling workflow `{run_id}`...")
+            )
+            return
+        await cancel_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Cancelled workflow `{run_id}`.")
+        )
+
+    def _launch_workflow_task(self, run_id: str, *, resume: bool) -> None:
+        task = asyncio.create_task(self._run_workflow_task(run_id, resume=resume))
+        self._workflow_tasks[run_id] = task
+
+    async def _run_workflow_task(self, run_id: str, *, resume: bool) -> None:
+        """Drive one workflow run to completion off the main chat task.
+
+        Never touches `self._agent_task` (reserved for the main chat turn);
+        always leaves a notice in the transcript on completion, failure, or
+        cancellation, per the founder-visible requirement that a workflow's
+        outcome lands in chat even if nobody was watching the workflow
+        screen.
+        """
+        run_dir = RunPaths.for_run(run_id, runs_root=DEFAULT_RUNS_ROOT).root
+        try:
+            if resume:
+                await resume_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+            else:
+                await execute_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+        except asyncio.CancelledError:
+            self._workflow_tasks.pop(run_id, None)
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Workflow `{run_id}` cancelled. Run dir: `{run_dir}`"
+                )
+            )
+            raise
+        except Exception as exc:
+            self._workflow_tasks.pop(run_id, None)
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Workflow `{run_id}` failed: {exc}\nRun dir: `{run_dir}`"
+                )
+            )
+            return
+        self._workflow_tasks.pop(run_id, None)
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Workflow `{run_id}` completed. Run dir: `{run_dir}`")
+        )
+
+    async def _push_workflow_screen(self, run_id: str) -> None:
+        """Best-effort: the live progress-tree screen is owned by a
+        different lane and may not exist in every build of this app. A
+        workflow still runs to completion (and still lands a transcript
+        notice) with or without it -- see this lane's integration report.
+        """
+        try:
+            from vibe.cli.textual_ui.widgets.workflow_screen import (  # type: ignore[import-not-found]
+                WorkflowScreen,
+            )
+        except ImportError:
+            return
+        with suppress(NoScreen):
+            self.push_screen(WorkflowScreen(run_id=run_id))
 
     async def _compact_history(self, cmd_args: str = "", **kwargs: Any) -> None:
         if self._agent_job_active():

@@ -68,15 +68,82 @@ and reports `"lost"` instead of `"running"` whenever the last known
 `kind: "run_status"` record (`"completed"` / `"failed"` / `"cancelled"`)
 appended before the process exits, so `lost` only ever applies to runs that
 never got the chance to write one.
+
+RUN CREATION / EXECUTION (not part of the frozen stub list -- added here per
+the contract's note that run creation and the execution driver belong to
+whichever lane implements this module's bodies):
+
+- `create_run(...)` persists a new run directory (script + meta.json) but
+  does not execute anything.
+- `execute_run(...)` drives one run to completion (or its first crash):
+  compiles the persisted script, constructs a real `WorkflowRuntime` wired
+  to a journal-writing `emit` callback and a caching `session_factory`, runs
+  `main(wf, args)`, and writes heartbeat + terminal `run_status` records
+  throughout. `resume_run` is a thin wrapper around this that first checks
+  the run is actually resumable and then re-runs the same driver -- the
+  driver itself is what makes resume "skip already-`ok` calls": its
+  `session_factory` hands out a no-network transport that replays a cached
+  answer for any call *position* (`call-{n}`) the prior journal already
+  recorded as `ok`/`cached`, and a real transport otherwise. See
+  `_CachedAskTransport` and `_resume_cache_by_position` below, and the
+  module-level "RESUME CACHING" note for why this keys by call position
+  rather than by a content hash of (prompt, opts).
+
+RESUME CACHING -- why by position, not by a (prompt, opts) content hash:
+
+The task this module was speced against describes keying the resume cache
+by "a stable hash of (prompt, canonical-sorted opts, occurrence-index)".
+That is the *semantic* goal, but the frozen JOURNAL SCHEMA above has no
+`prompt` or `opts` field on a `kind: "call"` record -- only `call_id`,
+`label`, `state`, `text`, `reason`. There is therefore no way to recover a
+prior call's prompt/opts from the journal to hash against. What the schema
+*does* give us is `call_id`, which is itself already a deterministic,
+content-independent position key (`call-{n}`, minted by the runtime as a
+monotonic counter in issuance order -- see `events.py`). Keying the resume
+cache by that position is equivalent to a content hash for the common case
+this feature exists for (re-attaching to a crashed run of the *same*
+script), and it is the only thing actually derivable from the frozen
+journal. If a script is edited between the original run and a resume, a
+position match no longer implies a prompt match -- this is a known,
+documented gap, not a silent bug; see the module's `README`-style comment
+on `_resume_cache_by_position` and this lane's integration report.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator, Mapping
+import contextlib
 from dataclasses import dataclass
+from datetime import UTC, datetime
+import itertools
+import json
+import os
 from pathlib import Path
-from typing import Literal
+import signal
+from typing import Any, Literal
 
-from vibe.workflows.events import WorkflowMeta
+from vibe.app_server._founderos_ask import (
+    DEFAULT_FOUNDEROS_ASK_URL,
+    DEFAULT_FOUNDEROS_WORKSPACE,
+    AskTransport,
+    FounderOSAskSession,
+    HttpFounderOSAskTransport,
+)
+from vibe.workflows.events import (
+    AgentCallEvent,
+    CallState,
+    PhaseEvent,
+    PhaseSpec,
+    WorkflowEvent,
+    WorkflowMeta,
+)
+from vibe.workflows.runtime import WorkflowRuntime
+from vibe.workflows.script import (
+    build_restricted_globals,
+    compile_workflow_main,
+    load_workflow_script,
+)
 
 HEARTBEAT_INTERVAL_S = 5.0
 """How often the owning process appends a `kind: "heartbeat"` record."""
@@ -90,6 +157,8 @@ DEFAULT_RUNS_ROOT = Path.home() / ".jarvis" / "workflows" / "runs"
 RunStatus = Literal["running", "completed", "failed", "cancelled", "lost"]
 """`"lost"` is a READER-computed status (see the liveness oracle above) --
 it is never the value of a `run_status` journal field."""
+
+TerminalRunStatus = Literal["completed", "failed", "cancelled"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,18 +207,522 @@ class RunDetail:
     args: dict[str, object]
 
 
+# -- journal I/O ------------------------------------------------------------
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _read_journal_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def _next_seq(path: Path) -> int:
+    records = _read_journal_records(path)
+    if not records:
+        return 0
+    return max((r.get("seq", -1) for r in records), default=-1) + 1
+
+
+def _position_of(call_id: str) -> int:
+    """`"call-7"` -> `7`. Matches the `events.py` id-minting contract."""
+    return int(call_id.rsplit("-", 1)[-1])
+
+
+class JournalWriter:
+    """Append-only writer for one run's `journal.jsonl`.
+
+    Reads the file once at construction to continue its `seq` counter
+    monotonically across process restarts (a fresh `JournalWriter` is built
+    on every `execute_run`/`resume_run`/`skip_run`/`cancel_run` call, and
+    `seq` must never reset or collide).
+    """
+
+    def __init__(self, path: Path, *, run_id: str) -> None:
+        self._path = path
+        self._run_id = run_id
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._seq = _next_seq(self._path)
+
+    def _append(self, record: dict[str, Any]) -> None:
+        full = {
+            "seq": self._seq,
+            "ts": _utc_now_iso(),
+            "run_id": self._run_id,
+            **record,
+        }
+        with self._path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(full, sort_keys=True))
+            fh.write("\n")
+        self._seq += 1
+
+    def write_event(
+        self,
+        event: WorkflowEvent,
+        *,
+        cached_positions: frozenset[int] | set[int] = frozenset(),
+    ) -> None:
+        """Flatten one `PhaseEvent`/`AgentCallEvent` into a journal record.
+
+        For an `AgentCallEvent` whose call position (see `_position_of`) is
+        in `cached_positions`, a terminal `"ok"` state is rewritten to
+        `"cached"` before writing -- `call_agent`/`WorkflowRuntime` can only
+        ever report `"ok"` for such a call (see `AgentCallStatus`, which has
+        no `"cached"` member); the cache/resume bookkeeping that knows a
+        call was actually served from disk lives entirely in this module.
+        """
+        if isinstance(event, PhaseEvent):
+            self._append({
+                "kind": "phase",
+                "phase_id": event.phase_id,
+                "call_id": None,
+                "parent_call_id": None,
+                "state": event.state,
+                "label": event.title,
+                "detail": event.detail,
+                "text": None,
+                "reason": None,
+                "message": None,
+                "level": None,
+                "pid": None,
+                "run_status": None,
+            })
+        elif isinstance(event, AgentCallEvent):
+            state: CallState = event.state
+            if state == "ok" and _position_of(event.call_id) in cached_positions:
+                state = "cached"
+            self.write_call_state(
+                phase_id=event.phase_id,
+                call_id=event.call_id,
+                state=state,
+                label=event.label,
+                text=event.text,
+                reason=event.reason,
+                parent_call_id=event.parent_call_id,
+            )
+        else:  # pragma: no cover - WorkflowEvent is a closed union
+            raise TypeError(f"unknown WorkflowEvent type: {type(event)!r}")
+
+    def write_call_state(
+        self,
+        *,
+        phase_id: str | None,
+        call_id: str,
+        state: CallState,
+        label: str | None = None,
+        text: str | None = None,
+        reason: str | None = None,
+        parent_call_id: str | None = None,
+    ) -> None:
+        """Append one `kind: "call"` record directly (used by `skip_run`,
+        which has no `AgentCallEvent` instance to hand `write_event`).
+        """
+        self._append({
+            "kind": "call",
+            "phase_id": phase_id,
+            "call_id": call_id,
+            "parent_call_id": parent_call_id,
+            "state": state,
+            "label": label,
+            "detail": None,
+            "text": text,
+            "reason": reason,
+            "message": None,
+            "level": None,
+            "pid": None,
+            "run_status": None,
+        })
+
+    def log(self, message: str, *, level: str = "info") -> None:
+        self._append({
+            "kind": "log",
+            "phase_id": None,
+            "call_id": None,
+            "parent_call_id": None,
+            "state": None,
+            "label": None,
+            "detail": None,
+            "text": None,
+            "reason": None,
+            "message": message,
+            "level": level,
+            "pid": None,
+            "run_status": None,
+        })
+
+    def heartbeat(self) -> None:
+        self._append({
+            "kind": "heartbeat",
+            "phase_id": None,
+            "call_id": None,
+            "parent_call_id": None,
+            "state": None,
+            "label": None,
+            "detail": None,
+            "text": None,
+            "reason": None,
+            "message": None,
+            "level": None,
+            "pid": os.getpid(),
+            "run_status": None,
+        })
+
+    def write_run_status(self, status: TerminalRunStatus | Literal["running"]) -> None:
+        self._append({
+            "kind": "run_status",
+            "phase_id": None,
+            "call_id": None,
+            "parent_call_id": None,
+            "state": None,
+            "label": None,
+            "detail": None,
+            "text": None,
+            "reason": None,
+            "message": None,
+            "level": None,
+            "pid": os.getpid(),
+            "run_status": status,
+        })
+
+
+# -- liveness oracle ----------------------------------------------------------
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists, we just can't signal it -- still alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _is_stale(ts_iso: str) -> bool:
+    try:
+        ts = datetime.fromisoformat(ts_iso)
+    except ValueError:
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    age = (datetime.now(UTC) - ts).total_seconds()
+    return age > HEARTBEAT_STALE_AFTER_S
+
+
+def _compute_status(
+    records: list[dict[str, Any]], *, created_at: str
+) -> tuple[RunStatus, str | None, int | None]:
+    """Fold a run's journal records into `(status, last_heartbeat_at, pid)`.
+
+    Never trusts a cached "running" value -- always recomputes liveness from
+    the last heartbeat age and pid liveness when no terminal `run_status`
+    record exists, per the frozen liveness oracle.
+    """
+    last_run_status_record: dict[str, Any] | None = None
+    last_heartbeat_ts: str | None = None
+    pid: int | None = None
+    for record in records:
+        if record.get("kind") == "run_status":
+            last_run_status_record = record
+            if record.get("pid") is not None:
+                pid = record["pid"]
+        elif record.get("kind") == "heartbeat":
+            last_heartbeat_ts = record["ts"]
+            if record.get("pid") is not None:
+                pid = record["pid"]
+
+    if (
+        last_run_status_record is not None
+        and last_run_status_record["run_status"] != "running"
+    ):
+        status: RunStatus = last_run_status_record["run_status"]
+        return status, last_heartbeat_ts, pid
+
+    if last_run_status_record is None:
+        # The run directory exists (create_run happened) but no process has
+        # ever appended a "running" record -- give it one heartbeat
+        # interval's grace from creation before treating it as "lost" (no
+        # pid was ever recorded, so pid-liveness can't be checked here).
+        lost = _is_stale(created_at)
+        return ("lost" if lost else "running"), last_heartbeat_ts, pid
+
+    reference_ts = last_heartbeat_ts or last_run_status_record["ts"]
+    lost = _is_stale(reference_ts) or not _pid_alive(pid)
+    return ("lost" if lost else "running"), last_heartbeat_ts, pid
+
+
+def _phase_id_for_call(journal_path: Path, call_id: str) -> str | None:
+    phase_id: str | None = None
+    for record in _read_journal_records(journal_path):
+        if record.get("kind") == "call" and record.get("call_id") == call_id:
+            phase_id = record.get("phase_id")
+    return phase_id
+
+
+def _resume_cache_by_position(journal_path: Path) -> dict[int, str]:
+    """Fold a prior journal into `{call position: cached final text}` for
+    every call whose latest recorded state is `"ok"`/`"cached"`. See the
+    module-level "RESUME CACHING" note for why this keys by position.
+    """
+    latest_by_call: dict[str, dict[str, Any]] = {}
+    for record in _read_journal_records(journal_path):
+        if record.get("kind") == "call" and record.get("call_id"):
+            latest_by_call[record["call_id"]] = record
+
+    cache: dict[int, str] = {}
+    for call_id, record in latest_by_call.items():
+        if record.get("state") in {"ok", "cached"} and record.get("text") is not None:
+            cache[_position_of(call_id)] = record["text"]
+    return cache
+
+
+class _CachedAskTransport:
+    """A no-network `AskTransport` that replays one cached final answer.
+
+    Handed out by `execute_run`'s `session_factory` for any call position a
+    prior journal already recorded as `"ok"`/`"cached"`, so resuming a run
+    never re-issues (and never re-bills) an agent call whose result is
+    already on disk.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def stream(
+        self, payload: Mapping[str, object]
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        del payload
+        return self._generate()
+
+    async def _generate(self) -> AsyncGenerator[dict[str, Any], None]:
+        yield {"type": "final_result", "data": {"answer": self._text}}
+
+    async def cancel(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+# -- run creation and execution ----------------------------------------------
+
+
+def create_run(
+    run_id: str,
+    script_path: Path,
+    args: dict[str, Any],
+    *,
+    runs_root: Path = DEFAULT_RUNS_ROOT,
+    cwd: Path | None = None,
+    endpoint: str | None = None,
+    workspace: str | None = None,
+) -> RunPaths:
+    """Create a new run directory for `run_id` executing `script_path`.
+
+    Loads and lints the script (raises `WorkflowScriptError` if invalid),
+    copies its source verbatim into the run dir, and writes `meta.json`
+    once. Does not execute the script -- see `execute_run` for that.
+    `run_id` is minted by the caller (see the module docstring); this
+    function never mints one itself, and raises `FileExistsError` if the
+    run directory already exists (an id collision, which should not happen
+    with proper minting).
+    """
+    loaded = load_workflow_script(script_path)
+    paths = RunPaths.for_run(run_id, runs_root=runs_root)
+    paths.root.mkdir(parents=True, exist_ok=False)
+    paths.script_path.write_text(loaded.source, encoding="utf-8")
+    meta_doc = {
+        "run_id": run_id,
+        "created_at": _utc_now_iso(),
+        "name": loaded.meta.name,
+        "description": loaded.meta.description,
+        "phases": [{"title": p.title, "detail": p.detail} for p in loaded.meta.phases],
+        "args": args,
+        "cwd": str((cwd or Path.cwd()).expanduser().resolve()),
+        "endpoint": endpoint,
+        "workspace": workspace,
+    }
+    paths.meta_path.write_text(
+        json.dumps(meta_doc, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return paths
+
+
+async def _heartbeat_loop(journal: JournalWriter) -> None:
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+        journal.heartbeat()
+
+
+async def execute_run(
+    run_id: str,
+    *,
+    runs_root: Path = DEFAULT_RUNS_ROOT,
+    endpoint: str | None = None,
+    workspace: str | None = None,
+) -> None:
+    """Execute (or resume) `run_id`'s workflow to completion.
+
+    Loads the run's persisted `script.py`/`meta.json`, builds a real
+    `WorkflowRuntime` wired to a journal-writing `emit` and a
+    resume-caching `session_factory` (see `_CachedAskTransport` /
+    `_resume_cache_by_position`), runs `main(wf, args)`, and writes
+    heartbeat + terminal `run_status` records throughout -- including on
+    failure or cancellation, so a run's owning process always leaves a
+    terminal record unless it is killed outright (the case the liveness
+    oracle's `"lost"` status exists for).
+
+    Not part of the frozen stub surface -- see the module's "RUN CREATION /
+    EXECUTION" note for why this lives here. `resume_run` is a thin
+    wrapper around this function.
+    """
+    paths = RunPaths.for_run(run_id, runs_root=runs_root)
+    if not paths.meta_path.exists():
+        raise FileNotFoundError(f"no run directory for {run_id!r} under {runs_root}")
+
+    loaded = load_workflow_script(paths.script_path)
+    meta_doc = json.loads(paths.meta_path.read_text(encoding="utf-8"))
+    args: dict[str, Any] = meta_doc.get("args", {})
+    cwd = Path(meta_doc.get("cwd") or str(Path.cwd()))
+    resolved_endpoint = endpoint or meta_doc.get("endpoint")
+    resolved_workspace = workspace or meta_doc.get("workspace")
+
+    journal = JournalWriter(paths.journal_path, run_id=run_id)
+    resume_texts = _resume_cache_by_position(paths.journal_path)
+    cached_positions: set[int] = set()
+    position_counter = itertools.count()
+
+    def session_factory() -> FounderOSAskSession:
+        n = next(position_counter)
+        cached_text = resume_texts.get(n)
+        transport: AskTransport
+        if cached_text is not None:
+            cached_positions.add(n)
+            transport = _CachedAskTransport(cached_text)
+        else:
+            transport = HttpFounderOSAskTransport(
+                endpoint=resolved_endpoint
+                or os.environ.get("FOUNDEROS_ASK_URL", DEFAULT_FOUNDEROS_ASK_URL),
+                workspace=resolved_workspace
+                or os.environ.get("FOUNDEROS_WORKSPACE", DEFAULT_FOUNDEROS_WORKSPACE),
+                api_key=os.environ.get("FOUNDEROS_API_KEY"),
+            )
+        return FounderOSAskSession(
+            transport=transport, cwd=cwd, session_id=f"wf-{run_id}-call-{n}"
+        )
+
+    def emit(event: WorkflowEvent) -> None:
+        journal.write_event(event, cached_positions=cached_positions)
+
+    # A terminal "running" record (and the heartbeat loop) must exist before
+    # anything else that can fail -- compiling the script, constructing the
+    # runtime -- runs, so even a failure to *start* leaves the run showing
+    # "failed" rather than sitting with no run_status record at all (see
+    # `_compute_status`'s no-record grace-then-"lost" branch).
+    journal.write_run_status("running")
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(journal))
+    try:
+        globals_dict = build_restricted_globals()
+        main = compile_workflow_main(loaded, globals_dict)
+        runtime = WorkflowRuntime(
+            run_id=run_id, meta=loaded.meta, session_factory=session_factory, emit=emit
+        )
+        await main(runtime, args)
+    except asyncio.CancelledError:
+        journal.write_run_status("cancelled")
+        raise
+    except Exception as exc:
+        journal.log(f"workflow run failed: {exc}", level="error")
+        journal.write_run_status("failed")
+        raise
+    else:
+        journal.write_run_status("completed")
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+# -- lifecycle stubs ----------------------------------------------------------
+
+
 def list_runs(*, runs_root: Path = DEFAULT_RUNS_ROOT) -> list[RunSummary]:
     """List every run under `runs_root`, most recently created first.
 
     Computes `status` per run via the liveness oracle above -- never
     trusts a cached "running" without checking the heartbeat/pid.
     """
-    raise NotImplementedError
+    if not runs_root.exists():
+        return []
+    summaries: list[RunSummary] = []
+    for entry in sorted(runs_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        meta_path = entry / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta_doc = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        journal_path = entry / "journal.jsonl"
+        status, last_heartbeat_at, _pid = _compute_status(
+            _read_journal_records(journal_path),
+            created_at=meta_doc.get("created_at", ""),
+        )
+        summaries.append(
+            RunSummary(
+                run_id=entry.name,
+                name=meta_doc.get("name", entry.name),
+                status=status,
+                created_at=meta_doc.get("created_at", ""),
+                last_heartbeat_at=last_heartbeat_at,
+            )
+        )
+    summaries.sort(key=lambda s: s.created_at, reverse=True)
+    return summaries
 
 
 def show_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> RunDetail:
     """Load one run's full detail, replaying its journal for current state."""
-    raise NotImplementedError
+    paths = RunPaths.for_run(run_id, runs_root=runs_root)
+    if not paths.meta_path.exists():
+        raise FileNotFoundError(f"no run directory for {run_id!r} under {runs_root}")
+    meta_doc = json.loads(paths.meta_path.read_text(encoding="utf-8"))
+    meta = WorkflowMeta(
+        name=meta_doc.get("name", run_id),
+        description=meta_doc.get("description", ""),
+        phases=[
+            PhaseSpec(title=p["title"], detail=p.get("detail", ""))
+            for p in meta_doc.get("phases", [])
+        ],
+    )
+    status, _last_heartbeat_at, _pid = _compute_status(
+        _read_journal_records(paths.journal_path),
+        created_at=meta_doc.get("created_at", ""),
+    )
+    return RunDetail(
+        run_id=run_id,
+        paths=paths,
+        meta=meta,
+        status=status,
+        args=meta_doc.get("args", {}),
+    )
 
 
 async def resume_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> None:
@@ -162,7 +735,13 @@ async def resume_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> Non
     re-issued -- this is the reason `vibe/workflows/events.py` freezes
     deterministic id-minting from call order alone.
     """
-    raise NotImplementedError
+    detail = show_run(run_id, runs_root=runs_root)
+    if detail.status not in {"lost", "failed"}:
+        raise ValueError(
+            f"run {run_id!r} is {detail.status!r}; only a 'lost' or 'failed' "
+            "run can be resumed"
+        )
+    await execute_run(run_id, runs_root=runs_root)
 
 
 async def skip_run(
@@ -173,8 +752,28 @@ async def skip_run(
     Used when a human decides a stuck or errored call should not be
     retried; appends a `kind: "call"`, `state: "skipped"` record so the
     next `resume_run` treats it as already terminal.
+
+    KNOWN GAP (see the module's "RESUME CACHING" note): this correctly
+    records the skip in the journal, so `show_run`/`list_runs` immediately
+    reflect it. But `execute_run`'s resume cache only short-circuits calls
+    whose last state was `"ok"`/`"cached"` (it has no way to synthesize an
+    `AgentCallResult(status="skipped", ...)` without a hook inside
+    `WorkflowRuntime.agent()`, which this lane does not own) -- a
+    subsequent `resume_run` will therefore still *re-issue* a skipped call
+    rather than honoring the skip during execution. Flagged for
+    integration; see this lane's report.
     """
-    raise NotImplementedError
+    paths = RunPaths.for_run(run_id, runs_root=runs_root)
+    if not paths.meta_path.exists():
+        raise FileNotFoundError(f"no run directory for {run_id!r} under {runs_root}")
+    journal = JournalWriter(paths.journal_path, run_id=run_id)
+    phase_id = _phase_id_for_call(paths.journal_path, call_id)
+    journal.write_call_state(
+        phase_id=phase_id,
+        call_id=call_id,
+        state="skipped",
+        reason="skipped by operator",
+    )
 
 
 async def cancel_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> None:
@@ -182,6 +781,28 @@ async def cancel_run(run_id: str, *, runs_root: Path = DEFAULT_RUNS_ROOT) -> Non
     `kind: "run_status"`, `run_status: "cancelled"` record.
 
     Must be safe to call on a `"lost"` run (no live owner to signal) --
-    in that case it only appends the terminal record.
+    in that case it only appends the terminal record. Never signals the
+    *current* process even if it happens to be the recorded pid (a caller
+    that owns the run in-process, e.g. the CLI's own `asyncio.Task`, should
+    cancel that task directly and let `execute_run`'s own
+    `except asyncio.CancelledError` handler write the terminal record --
+    calling this afterward is still safe, just redundant).
     """
-    raise NotImplementedError
+    paths = RunPaths.for_run(run_id, runs_root=runs_root)
+    if not paths.meta_path.exists():
+        raise FileNotFoundError(f"no run directory for {run_id!r} under {runs_root}")
+    meta_doc = json.loads(paths.meta_path.read_text(encoding="utf-8"))
+    status, _last_heartbeat_at, pid = _compute_status(
+        _read_journal_records(paths.journal_path),
+        created_at=meta_doc.get("created_at", ""),
+    )
+    if (
+        status == "running"
+        and pid is not None
+        and pid != os.getpid()
+        and _pid_alive(pid)
+    ):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGTERM)
+    journal = JournalWriter(paths.journal_path, run_id=run_id)
+    journal.write_run_status("cancelled")
