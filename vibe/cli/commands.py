@@ -227,6 +227,16 @@ class CommandRegistry:
                 ),
                 handler="_workflows_command",
             ),
+            "background": Command(
+                aliases=frozenset(["/background", "/bg"]),
+                description=(
+                    "Hand off a running workflow to a detached background "
+                    "process so it keeps running after this terminal closes. "
+                    "Use `/background` (targets the sole running workflow) "
+                    "or `/background <run_id>`."
+                ),
+                handler="_background_command",
+            ),
             "data-retention": Command(
                 aliases=frozenset(["/data-retention"]),
                 description="Show data retention information",

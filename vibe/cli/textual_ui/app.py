@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -287,6 +288,15 @@ from vibe.workflows import (
 )
 
 _VSCODE_FAMILY_TERMINALS = {Terminal.VSCODE, Terminal.VSCODE_INSIDERS, Terminal.CURSOR}
+
+# `/background`'s post-spawn liveness check (see
+# `_handoff_workflow_to_background`): how long to give the detached
+# `background_runner` subprocess to immediately crash before declaring the
+# handoff a success. Not a correctness requirement (the journal/heartbeat
+# oracle is always the ground truth for a run's actual status) -- just long
+# enough that an import-time or argument-parsing failure in the child
+# reliably shows up as a non-`None` `Popen.poll()` before we report success.
+_BACKGROUND_SPAWN_CHECK_DELAY_S = 0.3
 
 # Expected turn outcomes with bespoke user messages; not worth reporting to Sentry.
 _BENIGN_TURN_ERROR_CODES = {
@@ -784,6 +794,15 @@ class VibeApp(App):  # noqa: PLR0904
         # `WorkflowProgressScreen` subscribe to a `WorkflowRuntime` still
         # executing in this same process. See `_WorkflowRunBus`.
         self._workflow_buses: dict[str, _WorkflowRunBus] = {}
+        # run_ids currently mid `/background` handoff -- lets
+        # `_run_workflow_task`'s own `except asyncio.CancelledError` handler
+        # tell "cancelled because we're handing this run off to a detached
+        # process" apart from "cancelled because `/workflows cancel` (or Esc
+        # via `on_cancel`) really did mean stop this run", so it doesn't mount
+        # a misleading "Workflow cancelled" transcript notice right before
+        # `_handoff_workflow_to_background`'s own success/failure notice.
+        # See `_background_command`.
+        self._workflow_backgrounding: set[str] = set()
         self._init_controllers()
 
         self._loading_widget: LoadingWidget | None = None
@@ -4198,6 +4217,229 @@ class VibeApp(App):  # noqa: PLR0904
             UserCommandMessage(f"Cancelled workflow `{run_id}`.")
         )
 
+    async def _background_command(self, cmd_args: str = "", **kwargs: Any) -> None:
+        """`/background [run_id]` -- hand off a locally-running workflow to a
+        detached OS process so it survives this terminal closing.
+
+        No `run_id`: targets the sole entry in `self._workflow_tasks` if
+        there is exactly one; zero or more than one is an error (never
+        guesses which run to background -- see the two branches below).
+        An explicit `run_id` with no local task gets one of three distinct
+        messages (already finished / already running elsewhere / never
+        existed), never a single collapsed "not found".
+        """
+        run_id = (cmd_args or "").strip()
+        if not run_id:
+            active = {
+                rid: task
+                for rid, task in self._workflow_tasks.items()
+                if not task.done()
+            }
+            if not active:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        "No running workflow to background.",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            if len(active) > 1:
+                listed = "\n".join(f"  - `{rid}`" for rid in sorted(active))
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        "More than one workflow is running in this session -- "
+                        f"specify which one:\n{listed}\n"
+                        "Use `/background <run_id>`.",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            run_id = next(iter(active))
+
+        local_task = self._workflow_tasks.get(run_id)
+        if local_task is None or local_task.done():
+            try:
+                detail = show_run(run_id, runs_root=DEFAULT_RUNS_ROOT)
+            except FileNotFoundError:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"No workflow run `{run_id}` found -- it was never "
+                        "started in this session (or any other).",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            if detail.status in {"completed", "failed", "cancelled"}:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Workflow `{run_id}` already finished "
+                        f"({detail.status}) -- nothing to background.",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            # status in {"running", "lost"} but this session has no local
+            # task for it -- it's already executing outside this process
+            # (a prior `/background`, another session's `/workflows run`,
+            # or a crash this session never reattached to).
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Workflow `{run_id}` is already {detail.status} outside "
+                    "this session -- there's no local task here to hand off. "
+                    f"Use `/workflows show {run_id}` to reattach and watch it.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        await self._handoff_workflow_to_background(run_id, local_task)
+
+    def _background_runner_argv(self, run_id: str) -> list[str]:
+        """The `subprocess.Popen` argv for `run_id`'s detached process.
+
+        A separate method (rather than inlined in
+        `_handoff_workflow_to_background`) purely as a test seam: tests
+        exercising the real OS-level detachment mechanics (Popen +
+        `start_new_session=True` + log redirection + PID-alive check)
+        override this to point at a trivial fixture script instead of the
+        real `vibe.workflows.background_runner`, which is covered on its
+        own terms by `tests/workflows/test_background_runner.py`.
+        """
+        return [
+            sys.executable,
+            "-m",
+            "vibe.workflows.background_runner",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            str(DEFAULT_RUNS_ROOT),
+        ]
+
+    async def _handoff_workflow_to_background(
+        self, run_id: str, local_task: asyncio.Task[None]
+    ) -> None:
+        """Cancel `run_id`'s local task, then spawn a detached
+        `background_runner` process to take over driving it.
+
+        RACE SAFETY: step (a) fully cancels-and-awaits the local task
+        before step (b) spawns anything. `JournalWriter` (`run_manager.py`)
+        opens/writes/closes `journal.jsonl` synchronously on every append
+        with no buffering held open across calls, so once the `await`
+        below returns, the local task's own terminal "cancelled" journal
+        write (and its heartbeat-task teardown) has already fully
+        completed -- there is no window where the old (in-process) writer
+        and the new (subprocess) writer could both be mid-append to the
+        same file. See `vibe/workflows/background_runner.py`'s module
+        docstring for the full reasoning, including why the spawned
+        process calls `execute_run` rather than `resume_run`.
+        """
+        self._workflow_tasks.pop(run_id, None)
+        # Drop the live in-process bus too: it would otherwise still be
+        # sitting in `self._workflow_buses`, wired to a `WorkflowRuntime`
+        # that is about to stop emitting anything -- a later
+        # `/workflows show <run_id>` must fall back to `replay_events` +
+        # `get_run_status` polling (see `_push_workflow_screen`), not
+        # attach to a bus nothing will ever publish to again.
+        self._workflow_buses.pop(run_id, None)
+
+        self._workflow_backgrounding.add(run_id)
+        try:
+            local_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await local_task
+        finally:
+            self._workflow_backgrounding.discard(run_id)
+
+        run_dir = RunPaths.for_run(run_id, runs_root=DEFAULT_RUNS_ROOT).root
+        log_path = run_dir / "background.log"
+
+        cmd = self._background_runner_argv(run_id)
+        try:
+            log_handle = log_path.open("ab")
+        except OSError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Could not open background log `{log_path}` for "
+                    f"workflow `{run_id}`: {exc}",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+        except OSError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Failed to spawn background process for workflow "
+                    f"`{run_id}`: {exc}",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        finally:
+            log_handle.close()
+
+        # A `Popen` call succeeding only proves the fork/exec syscalls
+        # succeeded, never that the child didn't immediately crash (e.g.
+        # `vibe.workflows.background_runner` failing to import, or raising
+        # before it can even open the run's journal). Give it a brief
+        # moment, then actually check.
+        await asyncio.sleep(_BACKGROUND_SPAWN_CHECK_DELAY_S)
+        # A nonzero (or signal-killed) exit within the check window is a
+        # genuine crash -- report it plainly. A `0` exit, though, means the
+        # child ran to completion (e.g. a short/fully-cached workflow that
+        # finishes faster than `_BACKGROUND_SPAWN_CHECK_DELAY_S`) -- that is
+        # still a successful handoff, not a failure, and must not be
+        # reported as one.
+        exit_code = proc.poll()
+        if exit_code is not None and exit_code != 0:
+            tail = ""
+            with suppress(OSError):
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Workflow `{run_id}` background process exited "
+                    f"immediately (code {exit_code}) -- handoff failed.\n"
+                    f"Log (`{log_path}`):\n```\n{tail or '(empty)'}\n```",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        if exit_code == 0:
+            # The child already ran to completion inside the check window
+            # (a short or fully-cached workflow can finish faster than
+            # `_BACKGROUND_SPAWN_CHECK_DELAY_S`). The handoff itself still
+            # succeeded, but claiming it is "still running" would be a fake
+            # liveness claim about a process that has already exited -- say
+            # what actually happened instead.
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Workflow `{run_id}` handed off to background pid "
+                    f"{proc.pid}, which already finished (the run "
+                    f"completed before the handoff check ran). See "
+                    f"`/workflows show {run_id}` for the result.\n"
+                    f"Log: `{log_path}`"
+                )
+            )
+            return
+
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Workflow `{run_id}` handed off to background pid "
+                f"{proc.pid} -- still running after you close this "
+                f"terminal. Reattach with `/workflows show {run_id}`.\n"
+                f"Log: `{log_path}`"
+            )
+        )
+
     def _launch_workflow_task(self, run_id: str, *, resume: bool) -> None:
         bus = self._workflow_buses.setdefault(run_id, _WorkflowRunBus())
         task = asyncio.create_task(
@@ -4236,6 +4478,13 @@ class VibeApp(App):  # noqa: PLR0904
                 )
         except asyncio.CancelledError:
             self._workflow_tasks.pop(run_id, None)
+            if run_id in self._workflow_backgrounding:
+                # `_handoff_workflow_to_background` is the one cancelling
+                # this task, on purpose, as step (a) of the handoff -- it
+                # reports its own success/failure notice once the detached
+                # process is confirmed alive, so a generic "cancelled"
+                # notice here would be actively misleading.
+                raise
             await self._mount_and_scroll(
                 UserCommandMessage(
                     f"Workflow `{run_id}` cancelled. Run dir: `{run_dir}`"
