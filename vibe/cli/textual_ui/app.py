@@ -108,13 +108,7 @@ from vibe.cli.clipboard import (
 from vibe.cli.commands import Command, CommandContext, CommandRegistry
 from vibe.cli.lazy_audio_managers import (
     check_audio_available,
-    create_default_narrator_manager,
     create_default_voice_manager,
-)
-from vibe.cli.narrator_manager.narrator_manager_port import (
-    NarratorManagerListener,
-    NarratorManagerPort,
-    NarratorState,
 )
 from vibe.cli.plan_offer.presentation import plan_offer_cta, plan_title
 from vibe.cli.process_start import PROCESS_START_MONOTONIC, PROCESS_START_WALLCLOCK
@@ -188,7 +182,6 @@ from vibe.cli.textual_ui.widgets.messages import (
     WhatsNewMessage,
 )
 from vibe.cli.textual_ui.widgets.model_picker import ModelOption, ModelPickerApp
-from vibe.cli.textual_ui.widgets.narrator_status import NarratorStatus
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.path_display import PathDisplay
 from vibe.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
@@ -544,28 +537,6 @@ def _split_app_server_source(
     return None, source
 
 
-class _IdleNarratorManager:
-    @property
-    def state(self) -> NarratorState:
-        return NarratorState.IDLE
-
-    @property
-    def is_playing(self) -> bool:
-        return False
-
-    def on_turn_start(self, user_message: str) -> None: ...
-    def on_user_message(self, message_id: str) -> None: ...
-    def on_assistant_text(self, content: str) -> None: ...
-    def on_turn_error(self, message: str) -> None: ...
-    def on_turn_cancel(self) -> None: ...
-    def on_turn_end(self) -> None: ...
-    def cancel(self) -> None: ...
-    def sync(self) -> None: ...
-    def add_listener(self, listener: NarratorManagerListener) -> None: ...
-    def remove_listener(self, listener: NarratorManagerListener) -> None: ...
-    async def close(self) -> None: ...
-
-
 class _IdleVoiceManager:
     @property
     def is_enabled(self) -> bool:
@@ -597,10 +568,6 @@ class _IdleVoiceManager:
 
 def _noop_voice_manager() -> VoiceManagerPort:
     return cast(VoiceManagerPort, _IdleVoiceManager())
-
-
-def _noop_narrator_manager() -> NarratorManagerPort:
-    return cast(NarratorManagerPort, _IdleNarratorManager())
 
 
 _REJECT_HINT_BUSY = "wait for the current job to finish."
@@ -667,7 +634,6 @@ class VibeApp(App):  # noqa: PLR0904
         current_version: str = CORE_VERSION,
         terminal_notifier: NotificationPort | None = None,
         voice_manager: VoiceManagerPort | None = None,
-        narrator_manager: NarratorManagerPort | None = None,
         vscode_extension_promo: VscodeExtensionPromo | None = None,
         **kwargs: Any,
     ) -> None:
@@ -676,9 +642,7 @@ class VibeApp(App):  # noqa: PLR0904
         self._client_dependencies_ready = False
         self._prepare_lock = asyncio.Lock()
         self._provided_voice_manager = voice_manager
-        self._provided_narrator_manager = narrator_manager
         self._voice_manager: VoiceManagerPort = _noop_voice_manager()
-        self._narrator_manager: NarratorManagerPort = _noop_narrator_manager()
         self.commands: CommandRegistry = CommandRegistry()
         self._loop_commands: ScheduledLoopCommands
         self._terminal_notifier = terminal_notifier or TextualNotificationAdapter(
@@ -765,9 +729,6 @@ class VibeApp(App):  # noqa: PLR0904
             return
         self._voice_manager = (
             self._provided_voice_manager or self._make_default_voice_manager()
-        )
-        self._narrator_manager = (
-            self._provided_narrator_manager or self._make_default_narrator_manager()
         )
         self.commands = self._build_command_registry()
         self._loop_commands = ScheduledLoopCommands(
@@ -900,7 +861,6 @@ class VibeApp(App):  # noqa: PLR0904
             mention_stats=mention_stats,
         )
         for event in events:
-            self._track_narrator_event(event)
             if self.event_handler:
                 await self.event_handler.handle_event(
                     event, loading_widget=self._loading_widget
@@ -984,7 +944,6 @@ class VibeApp(App):  # noqa: PLR0904
 
     async def _refresh_config_from_disk(self) -> None:
         await self.app_server.resources.config.reload(reload_runtime=False)
-        self._narrator_manager.sync()
         self._refresh_command_registry()
 
     def get_default_screen(self) -> Screen:
@@ -1032,7 +991,6 @@ class VibeApp(App):  # noqa: PLR0904
             yield VerticalGroup(id="messages")
 
         with Horizontal(id="loading-area"):
-            yield NarratorStatus(self._narrator_manager)
             yield Static(id="loading-area-content")
             self._inline_notice = InlineNotice(id="inline-notice")
             yield self._inline_notice
@@ -1170,12 +1128,11 @@ class VibeApp(App):  # noqa: PLR0904
         self._chat_input_container = self.query_one(ChatInputContainer)
         self._chat_input_container.replace_command_registry(self.commands)
         self._refresh_command_registry()
-        # Compose binds idle noop voice/narrator managers on the cold mount-first
-        # path; the real managers were created in _initialize_client_dependencies.
-        # Re-bind them into the already-mounted widgets so voice input (Ctrl+R)
-        # and narrator status actually drive the real managers.
+        # Compose binds an idle noop voice manager on the cold mount-first path;
+        # the real manager was created in _initialize_client_dependencies.
+        # Re-bind it into the already-mounted widget so voice input (Ctrl+R)
+        # actually drives the real manager.
         self._chat_input_container.replace_voice_manager(self._voice_manager)
-        self.query_one(NarratorStatus).replace_narrator_manager(self._narrator_manager)
 
         self._refresh_profile_widgets()
 
@@ -1692,7 +1649,6 @@ class VibeApp(App):  # noqa: PLR0904
                 else "Voice mode disabled."
             )
             await self._mount_and_scroll(UserCommandMessage(message))
-        self._narrator_manager.sync()
         self._refresh_command_registry()
         if audio_error:
             self.notify(
@@ -1767,7 +1723,6 @@ class VibeApp(App):  # noqa: PLR0904
         audio_error = (
             check_audio_available()
             if changes.get("voice_mode_enabled") is True
-            or changes.get("narrator_enabled") is True
             else None
         )
         await self._queue.enqueue_command(
@@ -2527,7 +2482,6 @@ class VibeApp(App):  # noqa: PLR0904
             await self._handle_turn_event(event)
 
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
-        self._track_narrator_event(event)
         if isinstance(event, ServerWarning):
             self.notify(event.params.warning.message, severity="warning")
             return
@@ -2565,37 +2519,16 @@ class VibeApp(App):  # noqa: PLR0904
         self._queue.notify_busy_changed()
         await self._remove_loading_widget()
         await self._ensure_loading_widget()
-        self._narrator_manager.cancel()
-        self._narrator_manager.on_turn_start("")
 
     async def _complete_unsolicited_turn(self, event: TurnCompleted) -> None:
         if event.turn.status is PublicTurnStatus.FAILED:
             error = AppServerTurnError(event.turn.error)
             await self._handle_turn_error()
             message = self._resolve_turn_error_message(error)
-            self._narrator_manager.on_turn_error(message)
             await self._mount_turn_error(error, message)
         elif event.turn.status is PublicTurnStatus.INTERRUPTED:
             await self._handle_turn_error(cancelled=True)
-            self._narrator_manager.on_turn_cancel()
         await self._finalize_turn_ui()
-
-    def _track_narrator_event(self, event: AppServerEvent) -> None:
-        match event:
-            case HistoryEntryAdded(entry=PublicMessageEntry(role="user") as entry):
-                self._narrator_manager.on_user_message(entry.id)
-            case HistoryEntryAdded(entry=PublicMessageEntry(role="assistant") as entry):
-                self._narrator_manager.on_assistant_text(entry.text)
-            case HistoryEntryUpdated(
-                entry=PublicMessageEntry(role="assistant"), patch=patch
-            ):
-                for operation in patch:
-                    if (
-                        operation.op == "append"
-                        and operation.path == "/content/0/text"
-                        and isinstance(operation.value, str)
-                    ):
-                        self._narrator_manager.on_assistant_text(operation.value)
 
     async def _handle_turn(
         self,
@@ -2630,8 +2563,6 @@ class VibeApp(App):  # noqa: PLR0904
                 images = prepared.images or None
                 mentions = prepared.mentions
             message_id = None if injected else client_message_id or str(uuid4())
-            self._narrator_manager.cancel()
-            self._narrator_manager.on_turn_start("" if injected else prompt_text)
             async with aclosing(
                 self.app_server.act(
                     prompt_text,
@@ -2645,7 +2576,6 @@ class VibeApp(App):  # noqa: PLR0904
                 await self._handle_turn_events(events)
         except asyncio.CancelledError:
             await self._handle_turn_error(cancelled=True)
-            self._narrator_manager.on_turn_cancel()
             raise
         except Exception as e:
             await self._handle_turn_error()
@@ -2686,7 +2616,6 @@ class VibeApp(App):  # noqa: PLR0904
                     )
 
                 message = self._resolve_turn_error_message(e)
-                self._narrator_manager.on_turn_error(message)
 
                 await self._mount_turn_error(e, message)
         finally:
@@ -2747,7 +2676,6 @@ class VibeApp(App):  # noqa: PLR0904
         self._queue.notify_busy_changed()
 
     async def _finalize_turn_ui(self, *, resume_queue: bool = True) -> None:
-        self._narrator_manager.on_turn_end()
         self._interrupt_requested = False
         self._agent_task = None
         if self._loading_widget:
@@ -3750,7 +3678,6 @@ class VibeApp(App):  # noqa: PLR0904
     async def _apply_config_to_ui(self) -> None:
         await self._apply_theme(self.config.theme)
         await self._refresh_account()
-        self._narrator_manager.sync()
         self.run_worker(self._refresh_identity(), exclusive=False)
         self._sync_greeting_message()
 
@@ -4608,13 +4535,6 @@ class VibeApp(App):  # noqa: PLR0904
         if self._try_interrupt_bottom_app_escape():
             return True
 
-        if (
-            self._narrator_manager.is_playing
-            or self._narrator_manager.state != NarratorState.IDLE
-        ):
-            self._narrator_manager.cancel()
-            return True
-
         return False
 
     def _try_interrupt_running_job(self) -> bool:
@@ -4937,7 +4857,6 @@ class VibeApp(App):  # noqa: PLR0904
                 self._agent_task.cancel()
             if self._bash_task and not self._bash_task.done():
                 self._bash_task.cancel()
-            self._narrator_manager.cancel()
         finally:
             self.exit(result=self._get_session_exit_summary())
 
@@ -4956,8 +4875,6 @@ class VibeApp(App):  # noqa: PLR0904
         if self._client_dependencies_ready:
             with suppress(Exception):
                 await self._voice_manager.close()
-            with suppress(Exception):
-                await self._narrator_manager.close()
         if self._app_server is not None:
             with suppress(Exception):
                 await self._app_server.close()
@@ -5291,13 +5208,6 @@ class VibeApp(App):  # noqa: PLR0904
         # Textual doesn't repaint after resuming from Ctrl+Z (SIGTSTP);
         # force a full layout refresh so the UI isn't garbled.
         self.refresh(layout=True)
-
-    def _make_default_narrator_manager(self) -> NarratorManagerPort:
-        return create_default_narrator_manager(
-            config_getter=lambda: self.config,
-            summary_generator=self.app_server.resources.narration,
-            telemetry_client=self.app_server.resources.telemetry,
-        )
 
     def _handle_exception(self, error: Exception) -> None:
         if not isinstance(error, WorkerFailed):

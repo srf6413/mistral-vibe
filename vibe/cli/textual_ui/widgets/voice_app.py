@@ -57,12 +57,6 @@ class VoiceApp(VimNavigationMixin, Container):
                 "type": "cycle",
                 "options": ["On", "Off"],
             },
-            {
-                "key": "narrator_enabled",
-                "label": "Narrator (experimental)",
-                "type": "cycle",
-                "options": ["On", "Off"],
-            },
         ]
 
         self.title_widget: Static | None = None

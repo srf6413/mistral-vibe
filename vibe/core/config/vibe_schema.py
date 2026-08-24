@@ -483,6 +483,9 @@ class VibeConfigSchema(ConfigSchema):
     displayed_workdir: Annotated[str, WithReplaceMerge()] = ""
     context_warnings: Annotated[bool, WithReplaceMerge()] = False
     voice_mode_enabled: Annotated[bool, WithReplaceMerge()] = False
+    # Deprecated: the narrator (TTS-read-assistant-responses) feature was
+    # removed. Field kept (inert, always False in practice) to preserve the
+    # ConfigView/RuntimeSnapshot wire shape for app-server clients.
     narrator_enabled: Annotated[bool, WithReplaceMerge()] = False
     show_thinking_nodes: Annotated[bool, WithReplaceMerge()] = False
     bypass_tool_permissions: Annotated[bool, WithReplaceMerge()] = False

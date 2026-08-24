@@ -1437,14 +1437,6 @@ ContextProgress {
     }
 }
 
-NarratorStatus {
-    width: auto;
-    height: auto;
-    background: transparent;
-    padding: 0;
-    margin: 0;
-}
-
 #banner-container {
     align: left top;
     padding: 1 1 0 0;
