@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
 import json
@@ -14,6 +14,12 @@ from uuid import uuid4
 import httpx
 
 from vibe.agents import AgentSafety, AgentType
+from vibe.app_server._devstral_local import (
+    DEFAULT_DEVSTRAL_MODEL,
+    HttpOllamaChatTransport,
+    OllamaChatTransport,
+    stream_devstral_turn,
+)
 from vibe.app_server._patch import make_json_patch
 from vibe.app_server._shell import (
     ShellController,
@@ -75,6 +81,8 @@ from vibe.app_server.protocol import (
     ConfigFieldWire,
     ConfigLayerValueWire,
     ConfigMutationResponse,
+    ConfigWriteParams,
+    ConfigWriteResponse,
     EmptyResponse,
     FeedbackShouldShowResponse,
     IdentityReadResponse,
@@ -97,6 +105,12 @@ from vibe.user_content import UserResource
 
 DEFAULT_FOUNDEROS_ASK_URL = "http://127.0.0.1:8000/ask"
 DEFAULT_FOUNDEROS_WORKSPACE = "ysf"
+
+# The two selectable /model aliases. Single source of truth for both what
+# _build_resources() advertises to the picker and what act()/config-write
+# branch on -- there is deliberately no third "auto" option today.
+FOUNDEROS_ASK_MODEL_ALIAS = "founderos-ask"
+DEVSTRAL_MODEL_ALIAS = "devstral"
 
 
 class FounderOSAskError(RuntimeError):
@@ -312,8 +326,10 @@ class FounderOSAskSession:
         session_id: str | None = None,
         pins: AskPins | None = None,
         shell_controller: ShellController | None = None,
+        devstral_transport: OllamaChatTransport | None = None,
     ) -> None:
         self._transport = transport
+        self._devstral_transport = devstral_transport or HttpOllamaChatTransport()
         self._cwd = str(cwd.expanduser().resolve())
         self._session_id = session_id or f"vibe-{uuid4()}"
         self.pins = pins or AskPins()
@@ -326,11 +342,19 @@ class FounderOSAskSession:
             maxsize=64
         )
         self._closed = False
+        # Which model /model has selected for this session -- read by act() to
+        # branch backends, written back by the config/write handler built
+        # into _build_resources below (the model picker's only write path).
+        self._active_model_alias = FOUNDEROS_ASK_MODEL_ALIAS
         self.resources, self._resource_state, self._resource_client = _build_resources(
             session_id=self._session_id,
             cwd=self._cwd,
             shell_controller=shell_controller,
+            on_active_model_selected=self._set_active_model_alias,
         )
+
+    def _set_active_model_alias(self, alias: str) -> None:
+        self._active_model_alias = alias
 
     @classmethod
     def local(
@@ -426,6 +450,44 @@ class FounderOSAskSession:
         self._history.append(user_entry)
         self._turn_active = True
         self._active_turn_id = turn_id
+
+        if self._active_model_alias == DEVSTRAL_MODEL_ALIAS:
+            # The devstral backend bypasses the FounderOS /ask HTTP boundary
+            # entirely (a local Ollama chat, not "/ask routed to a local
+            # model") -- so none of the payload/pins/Compute-Budget-gate
+            # machinery below applies. It still owns the exact same
+            # turn/history bookkeeping every other backend owns: the user
+            # entry is already appended above, and this branch appends the
+            # streamed assistant entry itself as stream_devstral_turn's
+            # HistoryEntryAdded/Updated events arrive, mirroring what the
+            # FounderOS branch below does inline for its own transport.
+            self._pending_user_context.clear()
+            try:
+                async with aclosing(
+                    stream_devstral_turn(
+                        self._devstral_transport,
+                        history=list(self._history),
+                        session_id=self._session_id,
+                        turn_id=turn_id,
+                        started_at=started_at,
+                    )
+                ) as devstral_events:
+                    async for event in devstral_events:
+                        if isinstance(event, HistoryEntryAdded):
+                            self._history.append(event.entry)
+                        elif isinstance(event, HistoryEntryUpdated):
+                            self._history[-1] = event.entry
+                        yield event
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await self.interrupt()
+                raise
+            finally:
+                self._turn_active = False
+                self._active_turn_id = None
+                self._interrupted_turn_ids.discard(turn_id)
+            return
+
         assistant: PublicMessageEntry | None = None
         terminal_seen = False
         request_text = "\n\n".join([*self._pending_user_context, message])
@@ -606,6 +668,7 @@ class FounderOSAskSession:
             return
         self._interrupted_turn_ids.add(turn_id)
         await self._transport.cancel()
+        await self._devstral_transport.cancel()
         await self._events.put(
             ServerWarning(
                 ServerWarningParams(
@@ -662,6 +725,7 @@ class FounderOSAskSession:
         shell = cast(_LocalShellResource, self.resources.shell)
         await shell.close()
         await self._transport.close()
+        await self._devstral_transport.close()
         with suppress(asyncio.QueueFull):
             self._events.put_nowait(_EVENTS_CLOSED)
 
@@ -781,8 +845,14 @@ class _StaticResourceConnection:
 class _StaticResourceClient:
     """Static TUI support only; it is deliberately not a chat coordinator."""
 
-    def __init__(self, runtime: RuntimeReadResponse) -> None:
+    def __init__(
+        self,
+        runtime: RuntimeReadResponse,
+        *,
+        on_active_model_selected: Callable[[str], None] | None = None,
+    ) -> None:
         self._runtime = runtime
+        self._on_active_model_selected = on_active_model_selected
 
     def set_session_id(self, session_id: str) -> None:
         self._runtime = self._runtime.model_copy(
@@ -804,21 +874,34 @@ class _StaticResourceClient:
         if method == "runtime/read":
             response: object = self._runtime
         elif method == "config/fields/read":
-            alias = self._runtime.runtime.config.active_model.alias
+            config = self._runtime.runtime.config
+            alias = config.active_model.alias
             response = ConfigFieldsReadResponse(
                 fields=[
                     ConfigFieldWire(
                         name="active_model",
                         kind=ConfigFieldKind.ENUM,
-                        description="The model used by the attached FounderOS /ask session.",
+                        description=(
+                            "The model this vibe session sends turns to: "
+                            "FounderOS /ask (server-routed) or devstral "
+                            "(local Ollama, bypasses /ask entirely)."
+                        ),
                         value=alias,
                         path="active_model",
-                        enum_choices=[alias],
-                        layer_values=[ConfigLayerValueWire(layer="admin", value=alias)],
+                        enum_choices=[model.alias for model in config.models],
+                        # Deliberately NOT the "admin" layer: that layer is
+                        # what _is_active_model_enforced() (textual_ui/app.py)
+                        # checks to lock the picker. "default" is a real,
+                        # already-used origin (DEFAULT_ORIGIN in
+                        # screens/config/_common.py) for a genuinely
+                        # user-selectable field.
+                        layer_values=[ConfigLayerValueWire(layer="default", value=alias)],
                     )
                 ],
                 targets=[],
             )
+        elif method == "config/write":
+            response = self._write_config(cast(ConfigWriteParams, params))
         elif method == "session/ready/wait":
             response = SessionReadyWaitResponse(ready=True, init_duration_ms=0)
         elif method == "workspace/prompt/prepare":
@@ -853,6 +936,67 @@ class _StaticResourceClient:
                 f"{method} is not available in the attached local /ask session"
             )
         return cast(Any, response).model_dump(mode="json", by_alias=True)
+
+    def _write_config(self, params: ConfigWriteParams) -> ConfigWriteResponse:
+        """Apply /model's only real write op: set /active_model to a known alias.
+
+        Mirrors how ConfigResource.update() -> write() already surfaces
+        rejection/failure to the caller as an exception (see
+        _runtime_resources.py's ConfigResource.update): `rejected=True` on an
+        unknown alias, matching the same INVALID_PARAMS-shaped path a real
+        app-server config/write takes for a bad value. Any other path/op is
+        not modeled by this static client and fails the same way.
+        """
+        config = self._runtime.runtime.config
+        known_aliases = [candidate.alias for candidate in config.models]
+        new_active_model = config.active_model
+        rejected = False
+        failures: list[str] = []
+        for op in params.ops:
+            if op.path != "/active_model":
+                failures.append(
+                    f"Unsupported config path in the attached local /ask session: {op.path}"
+                )
+                continue
+            if op.op != "set":
+                failures.append(
+                    f"Unsupported config op in the attached local /ask session: {op.op}"
+                )
+                continue
+            selected = next(
+                (
+                    candidate
+                    for candidate in config.models
+                    if candidate.alias == op.value
+                ),
+                None,
+            )
+            if selected is None:
+                rejected = True
+                failures.append(
+                    f"Unknown model alias {op.value!r}; expected one of {known_aliases}"
+                )
+                continue
+            new_active_model = selected
+        if not rejected and not failures and new_active_model.alias != config.active_model.alias:
+            self._runtime = self._runtime.model_copy(
+                update={
+                    "runtime": self._runtime.runtime.model_copy(
+                        update={
+                            "config": config.model_copy(
+                                update={"active_model": new_active_model}
+                            )
+                        }
+                    )
+                }
+            )
+            if self._on_active_model_selected is not None:
+                self._on_active_model_selected(new_active_model.alias)
+        return ConfigWriteResponse(
+            runtime=self._runtime.runtime,
+            rejected=rejected,
+            failures=failures,
+        )
 
 
 class _LocalShellResource:
@@ -969,21 +1113,36 @@ class _LocalShellResource:
 
 
 def _build_resources(
-    *, session_id: str, cwd: str, shell_controller: ShellController | None
+    *,
+    session_id: str,
+    cwd: str,
+    shell_controller: ShellController | None,
+    on_active_model_selected: Callable[[str], None] | None = None,
 ) -> tuple[AppServerResources, ClientSessionState, _StaticResourceClient]:
     model = ModelConfigView(
         name="founderos-ask",
-        alias="founderos-ask",
+        alias=FOUNDEROS_ASK_MODEL_ALIAS,
         thinking="off",
         supports_images=False,
         display_name="FounderOS /ask",
+    )
+    devstral_model = ModelConfigView(
+        name=DEFAULT_DEVSTRAL_MODEL,
+        alias=DEVSTRAL_MODEL_ALIAS,
+        thinking="off",
+        supports_images=False,
+        display_name="Devstral (local, bypasses FounderOS /ask)",
     )
     audio_provider = AudioProviderView(
         api_base="", api_key_env_var="", client="mistral"
     )
     config = ConfigView(
         active_model=model,
-        active_model_pinned=True,
+        # Genuinely selectable: the model picker's short-circuit
+        # ("'active_model' is enforced by your administrator") depends on
+        # BOTH this flag and the "admin" config-field layer below never
+        # being true for a real /ask session again.
+        active_model_pinned=False,
         default_model_alias=model.alias,
         theme="auto",
         log_level="WARNING",
@@ -998,7 +1157,7 @@ def _build_resources(
         enable_update_checks=False,
         enable_notifications=False,
         vibe_code_enabled=False,
-        models=[model],
+        models=[model, devstral_model],
         transcribe_models=[],
         tts_models=[],
         transcription=TranscriptionConfigView(
@@ -1059,7 +1218,9 @@ def _build_resources(
         turns=[],
     )
     client_state = ClientSessionState(ClientBootstrap(state=state, runtime=runtime))
-    static_client = _StaticResourceClient(runtime)
+    static_client = _StaticResourceClient(
+        runtime, on_active_model_selected=on_active_model_selected
+    )
     connection = cast(
         AppServerResourceConnection, _StaticResourceConnection(static_client)
     )

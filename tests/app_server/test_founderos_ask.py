@@ -21,9 +21,14 @@ from vibe.app_server.events import (
     HistoryEntryUpdated,
     ServerWarning,
     TurnCompleted,
+    TurnStarted,
 )
 from vibe.app_server.models import PublicEffectEntry, PublicMessageEntry, TokenUsage
-from vibe.app_server.protocol import ShellRunParams, ShellRunResponse
+from vibe.app_server.protocol import (
+    AppServerResponseError,
+    ShellRunParams,
+    ShellRunResponse,
+)
 from vibe.app_server.session import AppServerSessionClient, SessionExitSummary
 from vibe.cli import cli as cli_mod
 from vibe.cli.textual_ui.app import (
@@ -153,6 +158,33 @@ class _FakeAskTransport:
         async def generate() -> AsyncGenerator[dict[str, Any], None]:
             for event in self.events:
                 yield event
+
+        return generate()
+
+    async def cancel(self) -> None:
+        self.cancel_count += 1
+
+    async def close(self) -> None:
+        self.close_count += 1
+
+
+class _FakeOllamaTransport:
+    """Mirrors _FakeAskTransport's convention for the devstral backend."""
+
+    def __init__(self, deltas: list[str] | None = None) -> None:
+        self._deltas = deltas or []
+        self.calls: list[list[dict[str, str]]] = []
+        self.cancel_count = 0
+        self.close_count = 0
+
+    def stream(
+        self, messages: list[dict[str, str]]
+    ) -> AsyncGenerator[str, None]:
+        self.calls.append(messages)
+
+        async def generate() -> AsyncGenerator[str, None]:
+            for delta in self._deltas:
+                yield delta
 
         return generate()
 
@@ -429,18 +461,109 @@ async def test_attached_resources_mount_the_existing_textual_ui(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_attached_config_fields_report_admin_model_and_pin(
+async def test_attached_config_reports_two_selectable_models(
     tmp_path: Path,
 ) -> None:
-    session = FounderOSAskSession(transport=_FakeAskTransport(), cwd=tmp_path)
+    """The /model picker's enforcement short-circuit
+    (_is_active_model_enforced in textual_ui/app.py) keys on BOTH the
+    active_model_pinned flag and the "admin" config-field layer -- both must
+    be genuinely off for the picker to ever be selectable again.
+    """
+    session = FounderOSAskSession(
+        transport=_FakeAskTransport(), cwd=tmp_path, devstral_transport=_FakeOllamaTransport()
+    )
 
     response = await session.resources.config.read_fields()
 
     field = next(field for field in response.fields if field.name == "active_model")
-    assert field.origin == "admin"
+    assert field.origin != "admin"
     assert field.value == "founderos-ask"
+    assert field.enum_choices == ["founderos-ask", "devstral"]
     assert response.targets == []
-    assert session.resources.config.current.active_model_pinned is True
+    config = session.resources.config.current
+    assert config.active_model_pinned is False
+    assert [model.alias for model in config.models] == ["founderos-ask", "devstral"]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_config_write_flips_active_model_alias_and_reload_keeps_it(
+    tmp_path: Path,
+) -> None:
+    session = FounderOSAskSession(
+        transport=_FakeAskTransport(), cwd=tmp_path, devstral_transport=_FakeOllamaTransport()
+    )
+    assert session._active_model_alias == "founderos-ask"
+
+    await session.resources.config.update({"active_model": "devstral"})
+
+    assert session._active_model_alias == "devstral"
+    assert session.resources.config.current.active_model.alias == "devstral"
+
+    # _persist_model (textual_ui/app.py) always follows a write with a
+    # reload -- the reload must not revert the switch.
+    reloaded = await session._resource_client.request("config/reload")
+    assert reloaded["runtime"]["config"]["activeModel"]["alias"] == "devstral"
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_config_write_rejects_unknown_model_alias(tmp_path: Path) -> None:
+    session = FounderOSAskSession(
+        transport=_FakeAskTransport(), cwd=tmp_path, devstral_transport=_FakeOllamaTransport()
+    )
+
+    with pytest.raises(AppServerResponseError, match="Invalid configuration edit"):
+        await session.resources.config.update({"active_model": "gpt-does-not-exist"})
+
+    assert session._active_model_alias == "founderos-ask"
+    assert session.resources.config.current.active_model.alias == "founderos-ask"
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_act_routes_to_founderos_transport_by_default(tmp_path: Path) -> None:
+    transport = _FakeAskTransport([
+        {"type": "final_result", "data": {"answer": "hi from founderos"}},
+    ])
+    devstral = _FakeOllamaTransport(["should not be used"])
+    session = FounderOSAskSession(
+        transport=transport, cwd=tmp_path, devstral_transport=devstral
+    )
+
+    events = [event async for event in session.act("hello")]
+
+    assert transport.payloads
+    assert devstral.calls == []
+    assistant = next(
+        event.entry
+        for event in events
+        if isinstance(event, HistoryEntryAdded)
+        and isinstance(event.entry, PublicMessageEntry)
+    )
+    assert assistant.text == "hi from founderos"
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_act_routes_to_devstral_when_selected(tmp_path: Path) -> None:
+    transport = _FakeAskTransport()
+    devstral = _FakeOllamaTransport(["Hi", " there"])
+    session = FounderOSAskSession(
+        transport=transport, cwd=tmp_path, devstral_transport=devstral
+    )
+    await session.resources.config.update({"active_model": "devstral"})
+
+    events = [event async for event in session.act("hello")]
+
+    assert transport.payloads == []
+    assert devstral.calls == [[{"role": "user", "content": "hello"}]]
+    assistant = cast(PublicMessageEntry, session.history[-1])
+    assert assistant.text == "Hi there"
+    assert assistant.generation_status.value == "completed"
+    assert isinstance(events[0], TurnStarted)
+    assert isinstance(events[-1], TurnCompleted)
+    assert session.turn_active is False
     await session.close()
 
 
