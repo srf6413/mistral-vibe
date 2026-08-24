@@ -197,6 +197,41 @@ async def test_session_id_opt_overrides_the_default_frontend_session_id(
     assert transports[0].payloads[0]["frontend_session_id"] == "wf-run-42-call-3"
 
 
+@pytest.mark.asyncio
+async def test_every_call_declares_chat_work_class_and_an_explicit_model(
+    fake_session_factory,
+) -> None:
+    """Compute Budget (ask-compute-budget-dispatch-v1) treats every /ask turn
+    as real dispatchable work by default -- work_class="chat" plus a real
+    model on every request is what keeps a workflow review turn from coming
+    back as a backgrounded engine dispatch or a "Parked /ask" stub instead of
+    text. This must hold with no opts at all, not just when opted in.
+    """
+    session_factory, transports = fake_session_factory([FakeAskTransport.ok("ack")])
+
+    await call_agent("hi", opts={}, session_factory=session_factory)
+
+    payload = transports[0].payloads[0]
+    assert payload["work_class"] == "chat"
+    assert payload["model"]
+    assert payload["model"] != "auto"
+
+
+@pytest.mark.asyncio
+async def test_model_opt_overrides_the_default_model_but_not_work_class(
+    fake_session_factory,
+) -> None:
+    session_factory, transports = fake_session_factory([FakeAskTransport.ok("ack")])
+
+    await call_agent(
+        "hi", opts={"model": "gpt-5-codex"}, session_factory=session_factory
+    )
+
+    payload = transports[0].payloads[0]
+    assert payload["model"] == "gpt-5-codex"
+    assert payload["work_class"] == "chat"
+
+
 # -- opts: schema (best-effort structured output) ----------------------
 
 _SCHEMA = {

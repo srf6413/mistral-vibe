@@ -58,6 +58,24 @@ _DECIDE_DONT_ASK_PREAMBLE = (
     "final answer within this turn.\n\n"
 )
 
+# Every workflow turn declares work_class="chat" so Compute Budget's engine
+# router (decision_ref ask-compute-budget-dispatch-v1) never treats a review
+# prompt as real dispatchable work: the only catalog entry competent for
+# "chat" (manus_delegate) is never-auto, so the gate falls through to
+# founder_paste instead of backgrounding a real grok_remote/codex_remote run.
+# See modules/ask_compute_dispatch.py (default_provider_candidates, work_class
+# catalogs) and modules/compute_budget.py (resolve_engine_forward) on the
+# FounderOS server for the authoritative routing logic this relies on.
+_WORKFLOW_WORK_CLASS = "chat"
+
+# An explicit model bypasses the frontend_session_id-driven prefer_fast->easy
+# (haiku) auto-select in _resolve_ask_models on the server -- without this,
+# work_class="chat" alone can still land on a "Parked /ask" stub instead of
+# real text, because the haiku check is independent of work_class. This is
+# the server's own FOUNDEROS_CHAT_MODEL_FALLBACK default (ask_models.py), not
+# an invented value -- a real, already-used model on this deployment.
+_WORKFLOW_DEFAULT_MODEL = "gpt-5-mini"
+
 _JSON_FENCE_PREFIXES = ("```json", "```")
 
 
@@ -108,11 +126,24 @@ def _last_assistant_text(previous: str | None, event: object) -> str | None:
     return previous
 
 
-async def _run_turn(session: FounderOSAskSession, message: str) -> str | None:
+async def _run_turn(
+    session: FounderOSAskSession,
+    message: str,
+    *,
+    work_class: str | None = None,
+    model: str | None = None,
+) -> str | None:
     """Drive one full `session.act(message)` turn to completion and return
     the final assistant text seen (`act()` itself raises
     `FounderOSAskStreamError` if a turn ends with no assistant text at
     all, so `None` here is defensive, not an expected path).
+
+    `work_class`/`model` pass straight through to `session.act(...)` -- see
+    that method's docstring for why a workflow call needs both: Compute
+    Budget (decision_ref ask-compute-budget-dispatch-v1) treats every /ask
+    turn as real dispatchable work by default, which would background a
+    real engine (or, failing that, park with no answer) instead of
+    returning text for review.
 
     Wrapped in `contextlib.aclosing` (not a bare `async for ... in
     session.act(...)`) so the underlying async generator -- and the
@@ -126,7 +157,9 @@ async def _run_turn(session: FounderOSAskSession, message: str) -> str | None:
     pattern.
     """
     text: str | None = None
-    async with contextlib.aclosing(session.act(message)) as events:
+    async with contextlib.aclosing(
+        session.act(message, work_class=work_class, model=model)
+    ) as events:
         async for event in events:
             text = _last_assistant_text(text, event)
     return text
@@ -166,7 +199,19 @@ async def call_agent(
       reserved keys any implementation should honor if present:
       `"timeout_seconds"` (float), `"pins"` (`AskPins`-shaped dict with
       `intake_model`/`worker_model`), `"session_id"` (str, overrides the
-      default derived id).
+      default derived id), `"model"` (str, overrides
+      `_WORKFLOW_DEFAULT_MODEL` on the `/ask` request itself -- distinct
+      from `pins`, which the server does not consult for the Compute
+      Budget model-resolution gate this exists to avoid; see
+      `_WORKFLOW_WORK_CLASS/_WORKFLOW_DEFAULT_MODEL` above).
+    - Every call sends `work_class="chat"` and an explicit `model`
+      (`opts["model"]` or `_WORKFLOW_DEFAULT_MODEL`) on the underlying
+      `/ask` request, unconditionally -- not opt-in per call. Both exist
+      to stop the FounderOS `/ask` server's Compute Budget engine router
+      from treating a workflow review turn as real dispatchable work (see
+      `_WORKFLOW_WORK_CLASS` above for the full mechanism). Without this,
+      a workflow prompt can come back as a background-dispatch receipt or
+      a "Parked /ask" stub instead of text.
 
     Structured-output limitation: this client boundary has no tool-forced
     JSON mode. When `opts["schema"]` (a JSON Schema dict) is given, the
@@ -206,9 +251,12 @@ async def call_agent(
             session.pins = AskPins(**pins)
 
         message = _DECIDE_DONT_ASK_PREAMBLE + prompt
+        call_model = str(opts.get("model") or "").strip() or _WORKFLOW_DEFAULT_MODEL
 
         async def run() -> AgentCallResult:
-            text = await _run_turn(session, message)
+            text = await _run_turn(
+                session, message, work_class=_WORKFLOW_WORK_CLASS, model=call_model
+            )
 
             if schema is not None and text is not None:
                 validation_error = _validate_against_schema(text, schema)
@@ -220,7 +268,12 @@ async def call_agent(
                         "Reply again with corrected JSON only that "
                         "satisfies the schema -- no prose, no code fence."
                     )
-                    text = await _run_turn(session, reask)
+                    text = await _run_turn(
+                        session,
+                        reask,
+                        work_class=_WORKFLOW_WORK_CLASS,
+                        model=call_model,
+                    )
 
             return AgentCallResult(status="ok", text=text, reason=None)
 

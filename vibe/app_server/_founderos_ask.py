@@ -389,6 +389,8 @@ class FounderOSAskSession:
         user_display_content: UserDisplayContent | None = None,
         mention_stats: MentionStats | None = None,
         injected: bool = False,
+        work_class: str | None = None,
+        model: str | None = None,
     ) -> AsyncGenerator[AppServerEvent, None]:
         del auto_title, user_display_content, mention_stats, injected
         if self._closed:
@@ -435,6 +437,18 @@ class FounderOSAskSession:
             "frontend_session_id": self._session_id,
             **self.pins.ask_fields(),
         }
+        # Compute Budget (decision_ref ask-compute-budget-dispatch-v1) routes every
+        # /ask turn through engine selection by default -- work_class="chat" keeps
+        # the only competent catalog entry (manus_delegate) never-auto, so the gate
+        # falls through to founder_paste instead of a real background dispatch; an
+        # explicit model bypasses the frontend_session_id-driven prefer_fast->easy
+        # (haiku) auto-select, which would otherwise return a "Parked /ask" stub
+        # instead of a real answer. Both are opt-in (None = today's behavior,
+        # unchanged for every other caller).
+        if work_class:
+            payload["work_class"] = work_class
+        if model:
+            payload["model"] = model
         try:  # noqa: PLR1702 - keep transport teardown around the linear stream
             yield TurnStarted(turn)
             async with aclosing(self._transport.stream(payload)) as stream:
