@@ -188,6 +188,70 @@ async def test_parallel_calls_render_as_siblings_keyed_by_call_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cached_call_renders_with_the_distinct_cycle_glyph() -> None:
+    """A call resumed from journal replay as already-`"cached"` must look
+    different from a fresh `"ok"` -- the task calls for "a cycle glyph".
+    """
+    events: list[WorkflowEvent] = [
+        AgentCallEvent(
+            run_id="wf-1",
+            phase_id="phase-0",
+            call_id="call-0",
+            label="Resumed from journal",
+            state="cached",
+            text="cached answer",
+        )
+    ]
+    screen = WorkflowProgressScreen(
+        run_id="wf-1", meta=_meta("Research"), events=events
+    )
+    app = _HarnessApp(screen)
+    async with app.run_test():
+        tree = screen.query_one(WorkflowTree)
+        label = _node(tree, "phase-0", "call-0").label.plain
+        assert "↻" in label
+        assert "✓" not in label  # distinct from a fresh "ok", not aliased to it
+
+
+@pytest.mark.asyncio
+async def test_nested_pipeline_step_attaches_under_its_parent_call_node() -> None:
+    """`parent_call_id` nests a call under another call WITHIN the same
+    phase (e.g. a `pipeline()` step) -- the child TreeNode's real Textual
+    parent must be the parent call's node, not the phase node, so the Tree
+    widget actually renders it indented one level deeper.
+    """
+    events: list[WorkflowEvent] = [
+        AgentCallEvent(
+            run_id="wf-1",
+            phase_id="phase-0",
+            call_id="call-0",
+            label="Pipeline",
+            state="running",
+        ),
+        AgentCallEvent(
+            run_id="wf-1",
+            phase_id="phase-0",
+            call_id="call-1",
+            label="Step 1",
+            state="running",
+            parent_call_id="call-0",
+        ),
+    ]
+    screen = WorkflowProgressScreen(
+        run_id="wf-1", meta=_meta("Research"), events=events
+    )
+    app = _HarnessApp(screen)
+    async with app.run_test():
+        tree = screen.query_one(WorkflowTree)
+        parent_node = _node(tree, "phase-0", "call-0")
+        child_node = _node(tree, "phase-0", "call-1")
+        assert child_node.parent is parent_node
+        assert child_node in parent_node.children
+        phase_node = _node(tree, "phase-0")
+        assert child_node not in phase_node.children
+
+
+@pytest.mark.asyncio
 async def test_skip_binding_only_fires_for_the_focused_running_call() -> None:
     skips: list[tuple[str, str]] = []
 
