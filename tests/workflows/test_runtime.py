@@ -18,7 +18,7 @@ import pytest
 from vibe.workflows import agent_call
 from vibe.workflows.agent_call import AgentCallResult
 from vibe.workflows.events import AgentCallEvent, PhaseEvent, WorkflowMeta
-from vibe.workflows.runtime import WorkflowRuntime
+from vibe.workflows.runtime import WorkflowBudget, WorkflowRuntime
 
 
 def _session_factory():
@@ -250,6 +250,28 @@ async def test_budget_exhausted_short_circuits_without_calling_call_agent(monkey
 
 
 @pytest.mark.asyncio
+async def test_budget_elapsed_time_ceiling_short_circuits_agent(monkeypatch):
+    fake = _RecordingCallAgent(AgentCallResult(status="ok", text="x", reason=None))
+    monkeypatch.setattr(agent_call, "call_agent", fake)
+
+    wf = _make_runtime()
+    # Swap in a budget whose clock reports the ceiling already crossed on
+    # the very first exhausted() check, independent of call count. Two
+    # ticks: one for `_ensure_started()`'s start-stamp, one for the elapsed
+    # check inside the same `exhausted()` call.
+    ticks = iter([0.0, 10.0])
+    wf._budget = WorkflowBudget(
+        max_calls=999.0, max_seconds=1.0, clock=lambda: next(ticks)
+    )
+
+    async with wf.phase("Phase A"):
+        result = await wf.agent("p1")
+
+    assert result.status == "cancelled"
+    assert fake.calls == []  # call_agent never invoked
+
+
+@pytest.mark.asyncio
 async def test_budget_does_not_overshoot_under_parallel(monkeypatch):
     async def fake_call_agent(prompt, *, opts, session_factory):
         await asyncio.sleep(0.01)
@@ -389,6 +411,20 @@ def test_log_rejects_invalid_level():
     wf = _make_runtime()
     with pytest.raises(ValueError):
         wf.log("x", level="bogus")
+
+
+def test_budget_elapsed_time_ceiling_is_enforced_independent_of_call_count():
+    # `_ensure_started()` consumes one clock tick to stamp `_start`; each
+    # `exhausted()` call after that consumes one more to compute elapsed
+    # time -- three ticks for two `exhausted()` calls.
+    ticks = iter([0.0, 10.0, 100.0])
+    budget = WorkflowBudget(
+        max_calls=999.0, max_seconds=50.0, clock=lambda: next(ticks)
+    )
+    assert budget.exhausted() is False  # elapsed 10s < 50s ceiling
+    assert (
+        budget.exhausted() is True
+    )  # elapsed 100s >= 50s ceiling, call count untouched
 
 
 def test_budget_property_exposes_workflow_budget():
