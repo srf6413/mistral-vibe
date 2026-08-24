@@ -35,9 +35,12 @@ import builtins as _builtins_module
 from dataclasses import dataclass
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vibe.workflows.events import PhaseSpec, WorkflowMeta
+
+if TYPE_CHECKING:
+    from vibe.workflows.runtime import WorkflowRuntime
 
 _BANNED_MODULES = ("time", "datetime", "random", "uuid")
 """Modules a workflow script may not import at all, in any form."""
@@ -279,3 +282,43 @@ def compile_workflow_main(
 
 def _is_async_callable(value: Any) -> bool:
     return inspect.iscoroutinefunction(value)
+
+
+async def run_workflow_script(
+    path: Path, wf: WorkflowRuntime, args: dict[str, Any]
+) -> None:
+    """Load, lint, compile, and run one workflow script's `main(wf, args)`.
+
+    The glue between this module (script loading/linting) and
+    `vibe.workflows.runtime.WorkflowRuntime` (the `wf` the script's `main`
+    receives) -- everything else in this file is deliberately usable on its
+    own (e.g. a UI that only wants `load_workflow_script(...).meta` to list
+    phases without running anything), so this helper is additive, not a
+    replacement for calling the pieces individually.
+
+    Sets the same nesting-guard `ContextVar` `runtime.py` uses around
+    `agent()` for the whole span of `main(...)`, not just around individual
+    `agent()` calls -- so an attempt to construct a second `WorkflowRuntime`
+    anywhere during a script's execution (not only mid-`agent()`-call) is
+    caught, matching the "workflows nest one level only" rule.
+
+    Not wired into `run_manager` (run creation / resume / the journal
+    writer) -- those remain that lane's `NotImplementedError` stubs to fill
+    in; this only covers "given a loaded script and a constructed `wf`, run
+    it."
+    """
+    # Local import: avoids a module-level import cycle (`runtime.py` does
+    # not import `script.py`, but importing `WorkflowRuntime` at module
+    # scope here would still be an unnecessary hard dependency for callers
+    # of this file who only want the loader/linter, not the runtime).
+    from vibe.workflows.runtime import _NESTING_GUARD
+
+    loaded = load_workflow_script(path)
+    globals_dict = build_restricted_globals()
+    main = compile_workflow_main(loaded, globals_dict)
+
+    token = _NESTING_GUARD.set(_NESTING_GUARD.get() + 1)
+    try:
+        await main(wf, args)
+    finally:
+        _NESTING_GUARD.reset(token)
