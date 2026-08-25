@@ -1,32 +1,13 @@
 from __future__ import annotations
 
-from vibe.cli.duplex_voice.duplex_config import (
-    DuplexVoiceSettings,
-    default_speech_config_view,
-    default_transcription_config_view,
-)
+from vibe.cli.duplex_voice.duplex_config import DuplexVoiceSettings
 
-
-def test_default_transcription_config_view_matches_jarvis_defaults() -> None:
-    view = default_transcription_config_view()
-
-    assert view.model.name == "voxtral-mini-transcribe-realtime-2602"
-    assert view.model.sample_rate == 16000
-    assert view.model.encoding == "pcm_s16le"
-    assert view.model.language == "en"
-    assert view.model.target_streaming_delay_ms == 500
-    assert view.provider.api_key_env_var == "MISTRAL_API_KEY"
-    assert view.provider.client == "mistral"
-
-
-def test_default_speech_config_view_matches_jarvis_defaults() -> None:
-    view = default_speech_config_view()
-
-    assert view.model.name == "voxtral-mini-tts-latest"
-    assert view.model.voice == "gb_jane_neutral"
-    assert view.model.response_format == "wav"
-    assert view.provider.api_key_env_var == "MISTRAL_API_KEY"
-    assert view.provider.client == "mistral"
+# `default_transcription_config_view`/`default_speech_config_view` moved to
+# `vibe.cli.duplex_voice.standalone_defaults` (see
+# `tests/cli/duplex_voice/test_standalone_defaults.py`) -- this module
+# (`duplex_config.py`) must not import `vibe.core` any more, since it's
+# reachable from `vibe.cli.textual_ui.app` now. See `duplex_config.py`'s
+# module docstring.
 
 
 def test_settings_default_to_livekit_server_dev_placeholders(monkeypatch) -> None:

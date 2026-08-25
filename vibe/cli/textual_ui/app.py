@@ -281,6 +281,8 @@ _MAX_INCOMPLETE_STREAM_RETRIES = 2
 
 
 if TYPE_CHECKING:
+    from vibe.cli.duplex_voice.agent_bridge import VoiceTurnBridge
+    from vibe.cli.duplex_voice.supervisor import DuplexVoiceSupervisor
     from vibe.cli.textual_ui.screens.config import ConfigWriteResult
     from vibe.cli.textual_ui.widgets.connector_auth_app import ConnectorAuthApp
     from vibe.cli.textual_ui.widgets.mcp_app import MCPApp
@@ -623,7 +625,7 @@ class VibeApp(App):  # noqa: PLR0904
         patch_driver_parser()
         return driver_class
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         history_file: Path,
         app_server: AppServerSource,
@@ -655,6 +657,18 @@ class VibeApp(App):  # noqa: PLR0904
         self._interrupt_requested = False
         self._agent_task: asyncio.Task | None = None
         self._bash_task: asyncio.Task | None = None
+        # Duplex (LiveKit) voice service: lazily constructed the first time
+        # voice mode is toggled on (see `_start_duplex_voice`), torn down on
+        # toggle-off and on app shutdown. `_duplex_voice_event_sink`, when
+        # set, is called for every AppServerEvent this app already renders
+        # (see `_handle_turn_event`) so a duplex-voice utterance that lands
+        # mid-turn against a turn the keyboard path started still hears the
+        # response -- not so keyboard-only turns get spoken (they aren't:
+        # nothing subscribes to the bridge unless a voice utterance opened
+        # a listening stream first).
+        self._duplex_voice_supervisor: DuplexVoiceSupervisor | None = None
+        self._duplex_voice_bridge: VoiceTurnBridge | None = None
+        self._duplex_voice_event_sink: Callable[[AppServerEvent], None] | None = None
         self._init_controllers()
 
         self._loading_widget: LoadingWidget | None = None
@@ -1640,6 +1654,16 @@ class VibeApp(App):  # noqa: PLR0904
             except Exception as exc:
                 logger.warning("Failed to apply voice mode locally", exc_info=exc)
                 audio_error = str(exc)
+            # Skip starting the duplex service on top of an audio subsystem
+            # already known to be unavailable (pre-check failure above, or
+            # the basic voice manager itself just failed to enable) --
+            # don't pile a second, confusing failure notification onto the
+            # one already shown for the same underlying cause. Always
+            # still attempt to STOP it, though: that's a safe no-op if it
+            # was never running, and must not be skipped just because the
+            # simple voice manager had trouble.
+            if not voice_enabled or audio_error is None:
+                self._apply_duplex_voice_enabled(voice_enabled)
             self.app_server.resources.telemetry.record(
                 "vibe.voice_mode_toggled", {"enabled": voice_enabled}
             )
@@ -1657,6 +1681,97 @@ class VibeApp(App):  # noqa: PLR0904
                 timeout=15,
                 markup=False,
             )
+
+    def _apply_duplex_voice_enabled(self, enabled: bool) -> None:
+        """Start/stop the duplex (LiveKit) voice service alongside the
+        existing simple push-to-talk voice manager, whenever
+        `voice_mode_enabled` toggles.
+
+        Runs as a background worker rather than being awaited inline: this
+        method is called from inside a queued command's payload (see
+        `_handle_voice_settings_closed`), and `DuplexVoiceSupervisor.start()`
+        can legitimately take several seconds (booting a real
+        `livekit-server --dev`) -- awaiting it here would stall queue drain
+        and keyboard input for that whole window.
+        """
+        self.run_worker(
+            self._toggle_duplex_voice(enabled),
+            exclusive=True,
+            group="duplex-voice",
+        )
+
+    async def _toggle_duplex_voice(self, enabled: bool) -> None:
+        if enabled:
+            await self._start_duplex_voice()
+        else:
+            await self._stop_duplex_voice()
+
+    async def _start_duplex_voice(self) -> None:
+        if self._duplex_voice_supervisor is not None:
+            return
+        # Imported lazily (not at module level) so `livekit` is never
+        # imported -- and never costs any startup time -- for a session
+        # that never turns voice mode on.
+        from vibe.cli.duplex_voice.agent_bridge import VoiceTurnBridge
+        from vibe.cli.duplex_voice.jarvis_llm import JarvisBridgeLLM
+        from vibe.cli.duplex_voice.supervisor import DuplexVoiceSupervisor
+
+        bridge = VoiceTurnBridge(
+            turn_active=lambda: self.app_server.turn_active,
+            # Reusing the app's own turn-dispatch methods verbatim -- the
+            # exact ones the keyboard/queue path already calls -- rather
+            # than re-implementing act()/inject_user_context() dispatch
+            # here. See `VoiceTurnBridge`'s docstring for why a transcript
+            # is routed through these instead of the bridge awaiting
+            # `act()`'s event stream itself.
+            start_new_turn=self._start_queued_agent_turn,
+            inject_mid_turn=self._inject_queued_prompt,
+        )
+        config = self.app_server.resources.config.current
+        supervisor = DuplexVoiceSupervisor(
+            transcription=config.transcription,
+            speech=config.speech,
+            llm_factory=lambda: JarvisBridgeLLM(bridge),
+            enable_mic=True,
+            muted=lambda: self._voice_manager.muted,
+        )
+        self._duplex_voice_bridge = bridge
+        self._duplex_voice_supervisor = supervisor
+        self._duplex_voice_event_sink = bridge.on_history_event
+        try:
+            await supervisor.start()
+        except BaseException as exc:
+            # BaseException, not Exception: this runs inside a worker (see
+            # `_apply_duplex_voice_enabled`) that Textual cancels on app
+            # shutdown or on a rapid second toggle (`exclusive=True`
+            # cancels the still-running previous one) -- CancelledError
+            # must reach this cleanup too, or a `livekit-server` subprocess
+            # that `start()` already spawned before being cancelled would
+            # be orphaned instead of torn down. A controlled
+            # `DuplexVoiceSupervisorError` (port taken, server/agent didn't
+            # come up in time) gets the exact same cleanup.
+            logger.warning("Failed to start duplex voice service", exc_info=exc)
+            with suppress(Exception):
+                await supervisor.stop()
+            self._duplex_voice_supervisor = None
+            self._duplex_voice_bridge = None
+            self._duplex_voice_event_sink = None
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            self.notify(
+                f"Duplex voice service failed to start: {exc}",
+                severity="warning",
+                timeout=15,
+                markup=False,
+            )
+
+    async def _stop_duplex_voice(self) -> None:
+        supervisor = self._duplex_voice_supervisor
+        self._duplex_voice_supervisor = None
+        self._duplex_voice_bridge = None
+        self._duplex_voice_event_sink = None
+        if supervisor is not None:
+            await supervisor.stop()
 
     async def _remove_config_field(self, field: str) -> None:
         response = await self.app_server.resources.config.write(
@@ -2482,6 +2597,13 @@ class VibeApp(App):  # noqa: PLR0904
             await self._handle_turn_event(event)
 
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
+        # Feeds the duplex voice bridge's TTS-out, when voice mode is on --
+        # a no-op sink otherwise. Called unconditionally, before any of the
+        # early returns below, so it sees every event this method handles
+        # regardless of type (it only actually reacts to streaming
+        # assistant-message text; see `VoiceTurnBridge.on_history_event`).
+        if self._duplex_voice_event_sink is not None:
+            self._duplex_voice_event_sink(event)
         if isinstance(event, ServerWarning):
             self.notify(event.params.warning.message, severity="warning")
             return
@@ -2620,6 +2742,18 @@ class VibeApp(App):  # noqa: PLR0904
                 await self._mount_turn_error(e, message)
         finally:
             await self._finalize_turn_ui(resume_queue=not retry_incomplete_stream)
+            # Tells the duplex voice bridge (if any subscriber is currently
+            # listening) that THIS turn is over, regardless of whether it
+            # was started by voice or by the keyboard/queue path -- the
+            # bridge itself has no other reliable way to see a turn all the
+            # way to its end (mid-turn `inject_user_context` steers an
+            # already-running turn without creating a new task to watch,
+            # and `act()` never yields TurnCompleted to its own solicited
+            # caller). Skipped while about to silently retry: the stream
+            # isn't actually over yet, and closing it here would finalize
+            # TTS output for content that's still incomplete.
+            if not retry_incomplete_stream and self._duplex_voice_bridge is not None:
+                self._duplex_voice_bridge.on_turn_finished()
 
         if retry_incomplete_stream:
             await self._auto_retry_incomplete_stream(incomplete_stream_retries + 1)
@@ -4863,6 +4997,14 @@ class VibeApp(App):  # noqa: PLR0904
     async def shutdown_cleanup(self) -> None:
         with suppress(Exception):
             await self._begin_shutdown()
+        # Stop the duplex voice service (livekit-server + in-process agent
+        # + mic publisher) before anything else below touches `app_server`
+        # or `_agent_task` -- covers normal quit, ctrl+c/ctrl+d (routed
+        # through `_force_quit`/`shutdown_cleanup` the same way), and
+        # SIGTERM, so no orphaned `livekit-server` process is left behind
+        # on any exit path. A no-op when voice mode was never turned on.
+        with suppress(Exception):
+            await self._stop_duplex_voice()
         for task in (self._agent_task, self._bash_task):
             if task is None or task.done():
                 continue

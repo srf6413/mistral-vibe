@@ -2,19 +2,21 @@
 end to end, WITHOUT the TUI.
 
 Not a pytest test (pytest's global per-test timeout in this repo is 10s;
-starting a real livekit-server + agent process and letting audio flow
-comfortably needs longer). Run it directly::
+starting a real livekit-server + agent and letting audio flow comfortably
+needs longer). Run it directly::
 
     uv run python scripts/duplex_voice_proof.py
 
 What it does, for real, no mocks:
 
-1. Starts the `DuplexVoiceSupervisor` (real `livekit-server --dev` +
-   real `vibe.cli.duplex_voice.agent` subprocess).
+1. Starts the `DuplexVoiceSupervisor` (real `livekit-server --dev`, and the
+   real `vibe.cli.duplex_voice.agent` pipeline running as an in-process
+   asyncio task -- see `supervisor.py`'s module docstring for why this is
+   in-process rather than a subprocess as of the TUI-wiring stage).
 2. Joins the same room as a second participant ("the user").
 3. Publishes a synthetic tone as that participant's mic track.
 4. Waits, then tears everything down and reports:
-   - whether the server/agent came up and the agent joined the room,
+   - whether the server came up and the agent joined the room,
    - whether the agent's STT plugin actually received audio frames,
    - whether it opened a Mistral transcription segment,
    - and how far it got: a real transcript (if MISTRAL_API_KEY is set and
@@ -24,12 +26,19 @@ If MISTRAL_API_KEY isn't available in this environment, that is reported
 explicitly rather than silently mocked around -- the pipeline plumbing
 (server up, agent joins, frames delivered, segment opened, connection
 attempted) is still proven; only the live Mistral round trip is not.
+
+Since the agent runs in-process now, its log lines land on this script's
+own `logging` module (under the `jarvis.duplex_voice` logger hierarchy)
+instead of a subprocess's redirected stdout file -- `_LogCapture` below
+collects them for the same string-matching assessment the original,
+subprocess-based version of this script did against its log file.
 """
 
 from __future__ import annotations
 
 import array
 import asyncio
+import logging
 import math
 from pathlib import Path
 import sys
@@ -40,6 +49,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from livekit import rtc
 
 from vibe.cli.duplex_voice.duplex_config import DuplexVoiceSettings
+from vibe.cli.duplex_voice.standalone_defaults import (
+    default_speech_config_view,
+    default_transcription_config_view,
+)
 from vibe.cli.duplex_voice.supervisor import (
     DuplexVoiceSupervisor,
     DuplexVoiceSupervisorError,
@@ -51,6 +64,23 @@ TONE_DURATION_S = 2.0
 TONE_FREQUENCY_HZ = 440.0
 TONE_AMPLITUDE = 12000  # loud relative to the plugin's 400.0 RMS threshold
 SETTLE_AFTER_PUBLISH_S = 3.0
+
+
+class _LogCapture(logging.Handler):
+    """Collects formatted `jarvis.duplex_voice.*` log records emitted
+    in-process during the proof run, standing in for the subprocess log
+    file the original version of this script read.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(self.format(record))
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
 
 
 def _make_tone_frame() -> rtc.AudioFrame:
@@ -95,12 +125,6 @@ def _print_header(title: str) -> None:
     print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
 
 
-def _read_log(path: Path) -> str:
-    if not path.exists():
-        return "(no log file)"
-    return path.read_text(errors="replace")
-
-
 def _report_mistral_key_status() -> None:
     api_key = resolve_api_key("MISTRAL_API_KEY")
     if api_key:
@@ -115,7 +139,7 @@ def _report_mistral_key_status() -> None:
 
 
 async def _start_supervisor_or_report(supervisor: DuplexVoiceSupervisor) -> bool:
-    _print_header("1. Starting supervisor (livekit-server --dev + agent)")
+    _print_header("1. Starting supervisor (livekit-server --dev + in-process agent)")
     try:
         await supervisor.start()
     except DuplexVoiceSupervisorError as exc:
@@ -124,9 +148,8 @@ async def _start_supervisor_or_report(supervisor: DuplexVoiceSupervisor) -> bool
 
     status = supervisor.status()
     print(f"server running: {status.server_running} (pid={status.server_pid})")
-    print(f"agent running:  {status.agent_running} (pid={status.agent_pid})")
+    print(f"agent running:  {status.agent_running} (in-process task)")
     print(f"server log: {status.server_log_path}")
-    print(f"agent log:  {status.agent_log_path}")
     if not (status.server_running and status.agent_running):
         print("FAILED: server and/or agent did not come up.")
         return False
@@ -190,7 +213,16 @@ async def main() -> int:
     _print_header("Duplex voice service layer -- standalone end-to-end proof")
     _report_mistral_key_status()
 
-    supervisor = DuplexVoiceSupervisor()
+    capture = _LogCapture()
+    capture.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    duplex_logger = logging.getLogger("jarvis.duplex_voice")
+    duplex_logger.addHandler(capture)
+    duplex_logger.setLevel(logging.DEBUG)
+
+    supervisor = DuplexVoiceSupervisor(
+        transcription=default_transcription_config_view(),
+        speech=default_speech_config_view(),
+    )
     try:
         if not await _start_supervisor_or_report(supervisor):
             return 1
@@ -198,12 +230,13 @@ async def main() -> int:
         await _join_and_publish_tone(supervisor.settings)
 
         _print_header("3. Agent log evidence")
-        agent_log = _read_log(supervisor.agent_log_path)
+        agent_log = capture.text()
         print(agent_log)
         _assess_agent_log(agent_log)
     finally:
         _print_header("5. Tearing down")
         await supervisor.stop()
+        duplex_logger.removeHandler(capture)
         port_freed = not await _port_still_bound()
         print(f"supervisor stopped; port 7880 freed: {port_freed}")
 
@@ -222,6 +255,7 @@ async def _port_still_bound() -> bool:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
     start = time.monotonic()
     exit_code = asyncio.run(main())
     print(f"\nTotal wall time: {time.monotonic() - start:.1f}s")

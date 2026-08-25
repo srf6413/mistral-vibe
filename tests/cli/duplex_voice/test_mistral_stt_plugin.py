@@ -8,12 +8,12 @@ from livekit.agents import APIConnectionError, stt
 from livekit.agents.types import APIConnectOptions
 import pytest
 
-from vibe.cli.duplex_voice.duplex_config import default_transcription_config_view
 from vibe.cli.duplex_voice.mistral_stt_plugin import (
     MistralDuplexSTT,
     _frame_to_mono_pcm16,
     _pcm16_rms,
 )
+from vibe.cli.duplex_voice.standalone_defaults import default_transcription_config_view
 from vibe.cli.transcribe.transcribe_client_port import (
     TranscribeDone,
     TranscribeError,

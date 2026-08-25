@@ -10,6 +10,36 @@ from tests.conftest import build_test_vibe_app, build_test_vibe_config
 from tests.stubs.fake_voice_manager import FakeVoiceManager
 
 
+@pytest.fixture(autouse=True)
+def _no_real_duplex_voice_service():
+    """This file is about the simple push-to-talk voice manager / config
+    persistence boundary, not the duplex (LiveKit) voice service --
+    `voice_mode_enabled=True` now also starts that (see
+    `VibeApp._apply_duplex_voice_enabled`), which would otherwise try to
+    boot a REAL `livekit-server` in the background on any machine that
+    happens to have the binary installed. Faked here so these tests stay
+    scoped to what they're actually about; the real thing is covered by
+    `tests/cli/duplex_voice/test_supervisor.py` and
+    `tests/cli/test_duplex_voice_toggle.py`.
+    """
+
+    class _FakeDuplexVoiceSupervisor:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    with patch(
+        "vibe.cli.duplex_voice.supervisor.DuplexVoiceSupervisor",
+        _FakeDuplexVoiceSupervisor,
+    ):
+        yield
+
+
 async def _wait_until(
     pilot, predicate: Callable[[], bool], timeout: float = 2.0
 ) -> bool:

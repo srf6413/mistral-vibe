@@ -9,8 +9,8 @@ from livekit.agents.types import APIConnectOptions
 import pytest
 
 from tests.stubs.fake_tts_client import FakeTTSClient
-from vibe.cli.duplex_voice.duplex_config import default_speech_config_view
 from vibe.cli.duplex_voice.mistral_tts_plugin import MistralDuplexTTS
+from vibe.cli.duplex_voice.standalone_defaults import default_speech_config_view
 from vibe.cli.tts.tts_client_port import TTSResult
 
 
