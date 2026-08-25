@@ -116,6 +116,11 @@ class CommandRegistry:
                 handler="action_toggle_debug_console",
                 side_channel=True,
             ),
+            "btw": Command(
+                aliases=frozenset(["/btw"]),
+                description="Ask a quick side question, answered from context only (no tools)",
+                handler="_btw_side_question",
+            ),
             "compact": Command(
                 aliases=frozenset(["/compact"]),
                 description="Compact conversation history by summarizing. Optionally pass instructions to guide the summary",
