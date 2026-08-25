@@ -1733,6 +1733,7 @@ class VibeApp(App):  # noqa: PLR0904
             speech=config.speech,
             llm_factory=lambda: JarvisBridgeLLM(bridge),
             enable_mic=True,
+            enable_playback=True,
             muted=lambda: self._voice_manager.muted,
         )
         self._duplex_voice_bridge = bridge
@@ -1740,6 +1741,13 @@ class VibeApp(App):  # noqa: PLR0904
         self._duplex_voice_event_sink = bridge.on_history_event
         try:
             await supervisor.start()
+            # Only flip on once duplex is actually up: duplex-mic capture
+            # and the old push-to-talk path (Ctrl+R) both open their own
+            # `sounddevice` input stream against the default microphone --
+            # see `VoiceManager.duplex_active`'s docstring for why they
+            # must not run at once. If `start()` raises below, this must
+            # stay False so Ctrl+R keeps working as the fallback.
+            self._voice_manager.duplex_active = True
         except BaseException as exc:
             # BaseException, not Exception: this runs inside a worker (see
             # `_apply_duplex_voice_enabled`) that Textual cancels on app
@@ -1756,6 +1764,7 @@ class VibeApp(App):  # noqa: PLR0904
             self._duplex_voice_supervisor = None
             self._duplex_voice_bridge = None
             self._duplex_voice_event_sink = None
+            self._voice_manager.duplex_active = False
             if isinstance(exc, asyncio.CancelledError):
                 raise
             self.notify(
@@ -1770,6 +1779,7 @@ class VibeApp(App):  # noqa: PLR0904
         self._duplex_voice_supervisor = None
         self._duplex_voice_bridge = None
         self._duplex_voice_event_sink = None
+        self._voice_manager.duplex_active = False
         if supervisor is not None:
             await supervisor.stop()
 

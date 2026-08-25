@@ -284,6 +284,94 @@ async def test_mic_publisher_failure_is_non_fatal_to_start(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_playback_subscriber_failure_is_non_fatal_to_start(monkeypatch) -> None:
+    """Mirrors `test_mic_publisher_failure_is_non_fatal_to_start`: a machine
+    with no working speakers (this sandbox included) must not turn
+    `enable_playback=True` into a failed toggle -- the agent bridge and
+    mic-in are still useful without local playback.
+    """
+    monkeypatch.setattr(supervisor_module, "run_duplex_agent", _fake_run_duplex_agent)
+
+    class _FailingPlayback:
+        def __init__(self, settings) -> None:
+            pass
+
+        async def run(self) -> None:
+            raise RuntimeError("sounddevice unavailable: no audio driver")
+
+    monkeypatch.setattr(supervisor_module, "PlaybackSubscriber", _FailingPlayback)
+
+    sup = DuplexVoiceSupervisor(
+        settings=DuplexVoiceSettings(room="test-room-playback-fail"),
+        enable_playback=True,
+        **_CONFIG,
+    )
+    _patch_fake_server(monkeypatch, sup)
+    try:
+        await sup.start()  # must not raise
+        assert sup.is_running
+        assert sup._playback_task is None
+    finally:
+        await sup.stop()
+
+
+@pytest.mark.asyncio
+async def test_playback_subscriber_starts_and_stops_with_the_supervisor(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(supervisor_module, "run_duplex_agent", _fake_run_duplex_agent)
+
+    constructed: list = []
+
+    class _RecordingPlayback:
+        def __init__(self, settings) -> None:
+            constructed.append(settings)
+            self.stopped = False
+
+        async def run(self) -> None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.stopped = True
+                raise
+
+    monkeypatch.setattr(supervisor_module, "PlaybackSubscriber", _RecordingPlayback)
+
+    settings = DuplexVoiceSettings(room="test-room-playback-lifecycle")
+    sup = DuplexVoiceSupervisor(settings=settings, enable_playback=True, **_CONFIG)
+    _patch_fake_server(monkeypatch, sup)
+
+    await sup.start()
+    assert len(constructed) == 1
+    assert constructed[0] is settings
+    assert sup._playback_task is not None
+
+    await sup.stop()
+    assert sup._playback_task is None
+
+
+@pytest.mark.asyncio
+async def test_playback_subscriber_not_started_when_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(supervisor_module, "run_duplex_agent", _fake_run_duplex_agent)
+
+    class _AssertNeverConstructed:
+        def __init__(self, settings) -> None:
+            raise AssertionError("PlaybackSubscriber must not be constructed")
+
+    monkeypatch.setattr(supervisor_module, "PlaybackSubscriber", _AssertNeverConstructed)
+
+    sup = DuplexVoiceSupervisor(
+        settings=DuplexVoiceSettings(room="test-room-playback-disabled"), **_CONFIG
+    )
+    _patch_fake_server(monkeypatch, sup)
+    try:
+        await sup.start()
+        assert sup._playback_task is None
+    finally:
+        await sup.stop()
+
+
+@pytest.mark.asyncio
 async def test_mic_publisher_muted_callable_is_threaded_through(monkeypatch) -> None:
     monkeypatch.setattr(supervisor_module, "run_duplex_agent", _fake_run_duplex_agent)
 

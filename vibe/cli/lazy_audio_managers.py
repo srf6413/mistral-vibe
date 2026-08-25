@@ -70,6 +70,18 @@ class LazyVoiceManager:
             return
         self._materialize().muted = value
 
+    @property
+    def duplex_active(self) -> bool:
+        if self._manager is None:
+            return False
+        return self._manager.duplex_active
+
+    @duplex_active.setter
+    def duplex_active(self, value: bool) -> None:
+        if self._manager is None and not value:
+            return
+        self._materialize().duplex_active = value
+
     def start_recording(self, mode: RecordingMode = RecordingMode.STREAM) -> None:
         self._materialize().start_recording(mode)
 

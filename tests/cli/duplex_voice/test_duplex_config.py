@@ -17,6 +17,8 @@ def test_settings_default_to_livekit_server_dev_placeholders(monkeypatch) -> Non
         "LIVEKIT_API_SECRET",
         "LIVEKIT_ROOM",
         "DUPLEX_IDENTITY",
+        "DUPLEX_HUMAN_IDENTITY",
+        "DUPLEX_LISTENER_IDENTITY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -26,6 +28,16 @@ def test_settings_default_to_livekit_server_dev_placeholders(monkeypatch) -> Non
     assert settings.api_key == "devkey"
     assert settings.api_secret == "secret"
     assert settings.as_env()["LIVEKIT_URL"] == settings.livekit_url
+    # The playback listener needs its own identity, distinct from both the
+    # agent and the mic publisher's `human_identity` -- see
+    # `vibe.cli.duplex_voice.playback_subscriber`'s module docstring for why
+    # (subscribing under the human's own identity would play their own mic
+    # back to them).
+    assert settings.listener_identity not in (
+        settings.agent_identity,
+        settings.human_identity,
+    )
+    assert settings.as_env()["DUPLEX_LISTENER_IDENTITY"] == settings.listener_identity
 
 
 def test_settings_respect_env_overrides(monkeypatch) -> None:
@@ -34,12 +46,14 @@ def test_settings_respect_env_overrides(monkeypatch) -> None:
     monkeypatch.setenv("LIVEKIT_API_SECRET", "custom-secret")
     monkeypatch.setenv("LIVEKIT_ROOM", "custom-room")
     monkeypatch.setenv("DUPLEX_IDENTITY", "custom-identity")
+    monkeypatch.setenv("DUPLEX_LISTENER_IDENTITY", "custom-listener")
 
     settings = DuplexVoiceSettings()
 
     assert settings.livekit_url == "ws://example.test:9999"
     assert settings.room == "custom-room"
     assert settings.agent_identity == "custom-identity"
+    assert settings.listener_identity == "custom-listener"
 
 
 def test_mint_token_produces_a_jwt_scoped_to_the_room() -> None:

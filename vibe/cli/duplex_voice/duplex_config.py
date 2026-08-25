@@ -29,6 +29,7 @@ _DEV_LIVEKIT_API_SECRET = "secret"
 _DEV_ROOM = "jarvis-duplex-voice"
 _DEV_AGENT_IDENTITY = "jarvis-duplex-agent"
 _DEV_HUMAN_IDENTITY = "jarvis-duplex-voice-user"
+_DEV_LISTENER_IDENTITY = "jarvis-duplex-voice-listener"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +68,21 @@ class DuplexVoiceSettings:
             "DUPLEX_HUMAN_IDENTITY", _DEV_HUMAN_IDENTITY
         )
     )
+    # A third, distinct room identity for whichever participant subscribes
+    # to the agent's synthesized-speech track and plays it through local
+    # speakers (see `vibe.cli.duplex_voice.playback_subscriber`). Needs its
+    # own identity for the same reason `human_identity` does: this is a
+    # single-machine, in-process setup, not a real multi-participant call,
+    # so nothing else in the room automatically renders the agent's TTS
+    # audio -- something has to join specifically to subscribe to it. It
+    # must NOT reuse `human_identity`, or it would also receive (and play
+    # back to the operator) that participant's own microphone track --
+    # feeding the human's own voice back into their speakers.
+    listener_identity: str = field(
+        default_factory=lambda: os.environ.get(
+            "DUPLEX_LISTENER_IDENTITY", _DEV_LISTENER_IDENTITY
+        )
+    )
 
     def as_env(self) -> dict[str, str]:
         """Serialize to the env vars a subprocess agent reads on startup.
@@ -83,6 +99,7 @@ class DuplexVoiceSettings:
             "LIVEKIT_ROOM": self.room,
             "DUPLEX_IDENTITY": self.agent_identity,
             "DUPLEX_HUMAN_IDENTITY": self.human_identity,
+            "DUPLEX_LISTENER_IDENTITY": self.listener_identity,
         }
 
     def mint_token(

@@ -98,9 +98,13 @@ async def test_start_duplex_voice_constructs_and_starts_the_supervisor(
         sup = fake_supervisors[0]
         assert sup.started is True
         assert sup.kwargs["enable_mic"] is True
+        assert sup.kwargs["enable_playback"] is True
         assert app._duplex_voice_supervisor is sup
         assert app._duplex_voice_bridge is not None
         assert app._duplex_voice_event_sink == app._duplex_voice_bridge.on_history_event
+        # Ctrl+R push-to-talk must be excluded once duplex is actually
+        # running -- see `VoiceManagerPort.duplex_active`.
+        assert app._voice_manager.duplex_active is True
 
         # Calling it again while already "on" must not construct a second
         # supervisor.
@@ -108,6 +112,7 @@ async def test_start_duplex_voice_constructs_and_starts_the_supervisor(
         assert len(fake_supervisors) == 1
 
         await app._stop_duplex_voice()
+        assert app._voice_manager.duplex_active is False
 
 
 @pytest.mark.asyncio
@@ -193,6 +198,41 @@ async def test_handle_turn_event_is_a_noop_sink_when_voice_is_off() -> None:
         assert app._duplex_voice_event_sink is None
         # Must not raise just because voice mode was never turned on.
         await app._handle_turn_event(_append_event("nobody is listening"))
+
+
+@pytest.mark.asyncio
+async def test_duplex_active_stays_false_when_supervisor_start_fails(
+    monkeypatch,
+) -> None:
+    """`duplex_active` gates Ctrl+R (see `VoiceManagerPort.duplex_active`);
+    if duplex never actually came up, Ctrl+R push-to-talk must keep
+    working as the fallback -- so a failed `supervisor.start()` must never
+    flip it on.
+    """
+
+    class _FailingSupervisor:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def start(self) -> None:
+            raise RuntimeError("boom: port already bound")
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "vibe.cli.duplex_voice.supervisor.DuplexVoiceSupervisor", _FailingSupervisor
+    )
+    fake_voice_manager = FakeVoiceManager(is_voice_ready=True)
+    app = build_test_vibe_app(voice_manager=fake_voice_manager)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        await app._start_duplex_voice()
+
+        assert app._duplex_voice_supervisor is None
+        assert app._voice_manager.duplex_active is False
 
 
 @pytest.mark.asyncio

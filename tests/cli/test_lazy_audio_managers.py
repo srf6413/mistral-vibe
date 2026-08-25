@@ -71,3 +71,32 @@ def test_lazy_voice_manager_materializes_when_used() -> None:
 
     factory.assert_called_once()
     assert manager.transcribe_state == TranscribeState.RECORDING
+
+
+def test_lazy_voice_manager_duplex_active_defaults_false_and_stays_lazy() -> None:
+    config = build_test_app_config(voice_mode_enabled=False)
+    factory = MagicMock(return_value=FakeVoiceManager(is_voice_ready=True))
+    manager = LazyVoiceManager(lambda: config, factory)
+
+    assert manager.duplex_active is False
+    factory.assert_not_called()
+
+    manager.duplex_active = False  # setting False must not force materialization
+    factory.assert_not_called()
+
+
+def test_lazy_voice_manager_duplex_active_forwards_to_real_manager_once_set() -> None:
+    config = build_test_app_config(voice_mode_enabled=False)
+    real = FakeVoiceManager(is_voice_ready=True)
+    factory = MagicMock(return_value=real)
+    manager = LazyVoiceManager(lambda: config, factory)
+
+    manager.duplex_active = True
+
+    factory.assert_called_once()
+    assert real.duplex_active is True
+    assert manager.duplex_active is True
+
+    manager.duplex_active = False
+    assert real.duplex_active is False
+    assert manager.duplex_active is False

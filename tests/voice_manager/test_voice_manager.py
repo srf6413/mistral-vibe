@@ -90,6 +90,37 @@ class TestStartRecording:
         assert manager.transcribe_state == TranscribeState.RECORDING
 
     @pytest.mark.asyncio
+    async def test_start_raises_when_duplex_active(self) -> None:
+        """Duplex voice mode's own continuous mic capture
+        (`vibe.cli.duplex_voice.mic_publisher.MicPublisher`) and this
+        push-to-talk path both open their own `sounddevice` input stream
+        against the same default microphone; Ctrl+R must refuse to start a
+        second, competing one while duplex mode already owns it (see
+        `VoiceManagerPort.duplex_active`).
+        """
+        manager, recorder, _ = _make_manager()
+        manager.duplex_active = True
+
+        with pytest.raises(RecordingStartError, match="Duplex voice mode"):
+            manager.start_recording()
+
+        assert manager.transcribe_state == TranscribeState.IDLE
+        assert not recorder.is_recording
+
+    @pytest.mark.asyncio
+    async def test_start_works_again_once_duplex_deactivates(self) -> None:
+        manager, recorder, _ = _make_manager()
+        manager.duplex_active = True
+        with pytest.raises(RecordingStartError):
+            manager.start_recording()
+
+        manager.duplex_active = False
+        manager.start_recording()
+
+        assert manager.transcribe_state == TranscribeState.RECORDING
+        assert recorder.is_recording
+
+    @pytest.mark.asyncio
     async def test_start_raises_when_no_audio_input(self) -> None:
         def raise_no_input(*a, **kw):
             raise NoAudioInputDeviceError("no device")

@@ -53,6 +53,7 @@ from vibe.cli.duplex_voice.agent import run_duplex_agent
 from vibe.cli.duplex_voice.duplex_config import DuplexVoiceSettings
 from vibe.cli.duplex_voice.echo_llm import EchoLLM
 from vibe.cli.duplex_voice.mic_publisher import MicPublisher
+from vibe.cli.duplex_voice.playback_subscriber import PlaybackSubscriber
 from vibe.utils.platform import is_windows
 
 if TYPE_CHECKING:
@@ -70,6 +71,7 @@ _HTTP_PORT = 7880
 _GRACEFUL_STOP_TIMEOUT_S = 5.0
 _AGENT_START_GRACE_S = 0.5
 _MIC_START_GRACE_S = 0.2
+_PLAYBACK_START_GRACE_S = 0.2
 
 
 class DuplexVoiceSupervisorError(RuntimeError):
@@ -179,6 +181,7 @@ class DuplexVoiceSupervisor:
         log_dir: Path | None = None,
         llm_factory: Callable[[], llm.LLM] | None = None,
         enable_mic: bool = False,
+        enable_playback: bool = False,
         muted: Callable[[], bool] | None = None,
     ) -> None:
         """`transcription`/`speech` are required, caller-supplied config for
@@ -201,6 +204,15 @@ class DuplexVoiceSupervisor:
         through to it to gate mic forwarding. Off by default so the
         existing proof script's own fake-participant/synthetic-tone
         publishing keeps working unchanged.
+
+        `enable_playback` additionally starts a `PlaybackSubscriber` that
+        joins the room and renders the agent's synthesized speech through
+        local speakers -- see `vibe.cli.duplex_voice.playback_subscriber`
+        for why that's a separate, real room participant rather than
+        something wired straight into the TTS plugin. Off by default for
+        the same reason `enable_mic` is: keeps
+        `scripts/duplex_voice_proof.py` (which asserts on log lines from a
+        room with exactly two participants) unchanged.
         """
         self._settings = settings or DuplexVoiceSettings()
         self._transcription = transcription
@@ -219,6 +231,7 @@ class DuplexVoiceSupervisor:
 
         self._llm_factory = llm_factory
         self._enable_mic = enable_mic
+        self._enable_playback = enable_playback
         self._muted = muted
 
         self._server_proc: asyncio.subprocess.Process | None = None
@@ -228,6 +241,7 @@ class DuplexVoiceSupervisor:
         self._agent_stop_event: asyncio.Event | None = None
 
         self._mic_task: asyncio.Task[None] | None = None
+        self._playback_task: asyncio.Task[None] | None = None
 
     @property
     def settings(self) -> DuplexVoiceSettings:
@@ -284,6 +298,14 @@ class DuplexVoiceSupervisor:
             # whole toggle. `_start_mic` logs and leaves `_mic_task` unset
             # on failure.
             await self._start_mic()
+
+        if self._enable_playback:
+            # Same non-fatal contract as `_start_mic`: a machine/container
+            # with no working speakers should still get a working agent
+            # bridge (text still round-trips through the turn), not a hard
+            # failure on the whole toggle. `_start_playback` logs and
+            # leaves `_playback_task` unset on failure.
+            await self._start_playback()
 
     async def _start_server(self) -> None:
         self._server_log_fh = open(self._server_log_path, "wb")
@@ -368,7 +390,25 @@ class DuplexVoiceSupervisor:
         self._mic_task = task
         logger.info("duplex mic publisher running (in-process task)")
 
+    async def _start_playback(self) -> None:
+        playback = PlaybackSubscriber(self._settings)
+        task = asyncio.create_task(
+            playback.run(), name="jarvis-duplex-voice-playback"
+        )
+        await asyncio.sleep(_PLAYBACK_START_GRACE_S)
+        if task.done():
+            exc = task.exception()
+            logger.warning(
+                "duplex playback subscriber failed to start; continuing without "
+                "local speaker output (agent bridge and mic-in are unaffected): %r",
+                exc,
+            )
+            return
+        self._playback_task = task
+        logger.info("duplex playback subscriber running (in-process task)")
+
     async def stop(self) -> None:
+        await self._stop_playback()
         await self._stop_mic()
         await self._stop_agent()
         await self._stop_server()
@@ -409,6 +449,16 @@ class DuplexVoiceSupervisor:
         if task is None or task.done():
             return
         logger.info("stopping duplex mic publisher")
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    async def _stop_playback(self) -> None:
+        task = self._playback_task
+        self._playback_task = None
+        if task is None or task.done():
+            return
+        logger.info("stopping duplex playback subscriber")
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
