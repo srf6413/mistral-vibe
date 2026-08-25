@@ -389,6 +389,8 @@ class FounderOSAskSession:
         user_display_content: UserDisplayContent | None = None,
         mention_stats: MentionStats | None = None,
         injected: bool = False,
+        require_ack: bool | None = None,
+        model: str | None = None,
     ) -> AsyncGenerator[AppServerEvent, None]:
         del auto_title, user_display_content, mention_stats, injected
         if self._closed:
@@ -435,6 +437,30 @@ class FounderOSAskSession:
             "frontend_session_id": self._session_id,
             **self.pins.ask_fields(),
         }
+        # Compute Budget (decision_ref ask-compute-budget-dispatch-v1) routes every
+        # /ask turn through engine selection by default. Two independent gates
+        # both need clearing to reach the real in-process reasoning loop instead of
+        # a backgrounded dispatch or a "Parked /ask" stub -- confirmed empirically
+        # against the live dev tip, not just read from source:
+        #   1) require_ack=True trips is_founder_bound_work() -> gate_action
+        #      "human_surface" instead of "direct_forward". Deliberately NOT
+        #      work_class="chat": that narrows the provider catalog to the single
+        #      never-auto manus_delegate candidate, and when it isn't reachable
+        #      decide_provider_route() resolves no provider at all, so ARC start
+        #      itself raises ("requires a resolved Compute Budget provider") before
+        #      the gate is ever reached. require_ack leaves the catalog alone (a
+        #      real reachable engine like grok_remote still gets picked for ARC's
+        #      own bookkeeping) while still avoiding direct_forward.
+        #   2) An explicit model bypasses the SEPARATE frontend_session_id-driven
+        #      prefer_fast->easy(haiku) auto-select in _resolve_ask_models -- that
+        #      one alone (independent of gate_action) is also enough to skip the
+        #      in-process loop and return a "Parked /ask" stub with no text.
+        # Both are opt-in (None = today's behavior, unchanged for every other
+        # caller).
+        if require_ack:
+            payload["require_ack"] = True
+        if model:
+            payload["model"] = model
         try:  # noqa: PLR1702 - keep transport teardown around the linear stream
             yield TurnStarted(turn)
             async with aclosing(self._transport.stream(payload)) as stream:

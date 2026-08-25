@@ -216,6 +216,17 @@ class CommandRegistry:
                 ),
                 handler="_loop_command",
             ),
+            "workflows": Command(
+                aliases=frozenset(["/workflows"]),
+                description=(
+                    "Run a multi-agent workflow script in the background. "
+                    "Use `/workflows run <path> [json-args]`, `/workflows list`, "
+                    "`/workflows show <run_id>`, `/workflows resume <run_id>`, "
+                    "`/workflows skip <run_id> <call_id>`, or "
+                    "`/workflows cancel <run_id>`"
+                ),
+                handler="_workflows_command",
+            ),
             "data-retention": Command(
                 aliases=frozenset(["/data-retention"]),
                 description="Show data retention information",

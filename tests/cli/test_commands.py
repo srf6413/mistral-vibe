@@ -241,3 +241,20 @@ class TestCommandRegistry:
         help_text = registry.get_help_text()
         for alias in ["`/exit`", "`exit`", "`quit`", "`:q`", "`:quit`"]:
             assert alias in help_text, alias
+
+    def test_workflows_command_resolves_to_a_real_app_handler(self) -> None:
+        # A typo in `handler="..."` would ship silently -- nothing else in
+        # this suite enumerates handlers against the app class that owns
+        # them, so this is the one place that seam is checked.
+        from vibe.cli.textual_ui.app import VibeApp
+
+        registry = CommandRegistry()
+        result = registry.parse_command("/workflows list")
+        assert result is not None
+        cmd_name, cmd, cmd_args = result
+        assert cmd_name == "workflows"
+        assert cmd_args == "list"
+        assert "/workflows" in registry.commands["workflows"].aliases
+        assert hasattr(VibeApp, cmd.handler), (
+            f"CommandRegistry points at VibeApp.{cmd.handler}, which does not exist"
+        )
