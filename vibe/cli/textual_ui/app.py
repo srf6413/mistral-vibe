@@ -3907,6 +3907,49 @@ class VibeApp(App):  # noqa: PLR0904
         widget = await self._loop_commands.handle_command(cmd_args)
         await self._mount_and_scroll(widget)
 
+    _BTW_WRAPPER = (
+        "<system-reminder>This is a side question from the user. Answer it "
+        "directly in a single response, using only what you already know "
+        "from the conversation so far.\n\n"
+        "- Do not use tools: you cannot read files, run commands, or search.\n"
+        "- This is one-off -- there is no follow-up turn, so don't say "
+        '"let me check" or promise to investigate.\n'
+        "- If you don't know, say so plainly.</system-reminder>\n\n{question}"
+    )
+
+    async def _btw_side_question(self, cmd_args: str = "", **kwargs: Any) -> None:
+        question = cmd_args.strip()
+        if not question:
+            await self._mount_and_scroll(
+                ErrorMessage("Usage: /btw <question>", collapsed=self._tools_collapsed)
+            )
+            return
+
+        if self._agent_job_active():
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Cannot ask a side question while the agent is processing. "
+                    "Please wait.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        prepared = await self._prepare_prompt_or_abort(question)
+        if prepared is None:
+            return
+
+        wrapped = self._BTW_WRAPPER.format(question=prepared.prompt_text)
+        prepared = prepared.model_copy(update={"prompt_text": wrapped})
+
+        message_id = str(uuid4())
+        self._agent_task = asyncio.create_task(
+            self._handle_turn(
+                question, prepared_prompt=prepared, client_message_id=message_id
+            )
+        )
+        self._queue.notify_busy_changed()
+
     async def _compact_history(self, cmd_args: str = "", **kwargs: Any) -> None:
         if self._agent_job_active():
             await self._mount_and_scroll(
