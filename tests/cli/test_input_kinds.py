@@ -26,3 +26,17 @@ def test_classify_keeps_bare_synonym_with_trailing_text_as_prompt(value: str) ->
     result = _classify(value)
     assert isinstance(result, Prompt)
     assert result.text == value
+
+
+@pytest.mark.parametrize("value", ["/compact", "/compact summarize the last hour"])
+def test_classify_sends_compact_through_as_a_plain_prompt(value: str) -> None:
+    """`/compact` has no client-side command registration (unlike `/exit`) and
+    no matching skill, so it must fall through to Prompt and travel to
+    FounderOS /ask as ordinary text — exactly like /remember, /recall,
+    /lessons, and /synth already do. FounderOSAskSession.compact() has no
+    working client endpoint; routing `/compact` through the normal turn path
+    lets the server-side memory-command parser handle it instead.
+    """
+    result = _classify(value)
+    assert isinstance(result, Prompt)
+    assert result.text == value
