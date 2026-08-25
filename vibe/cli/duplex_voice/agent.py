@@ -49,6 +49,7 @@ from livekit import rtc
 from livekit.agents import Agent, AgentSession, llm
 
 from vibe.app_server.config import SpeechConfigView, TranscriptionConfigView
+from vibe.cli.duplex_voice.announce_lock import SpeakingLockCoordinator
 from vibe.cli.duplex_voice.duplex_config import DuplexVoiceSettings
 from vibe.cli.duplex_voice.mistral_stt_plugin import MistralDuplexSTT
 from vibe.cli.duplex_voice.mistral_tts_plugin import MistralDuplexTTS
@@ -129,12 +130,23 @@ async def run_duplex_agent(
     )
 
     session = _build_session(llm_plugin, transcription=transcription, speech=speech)
+    # Makes this session's "speaking" state a participant in the same
+    # shared lock `~/.claude/hooks/speak.sh` uses on this Mac, so a live
+    # voice reply and a background Claude Code session's TTS announcement
+    # never talk over each other -- see `announce_lock`'s module docstring.
+    announce_coordinator = SpeakingLockCoordinator()
+    session.on("agent_state_changed", announce_coordinator.on_state_changed)
     try:
         await session.start(agent=DuplexVoiceAgent(), room=room)
         logger.info("session started -- duplex voice agent running")
         await stop_event.wait()
     finally:
         logger.info("tearing down session")
+        # Before `session.aclose()`, not after: releases the announce lock
+        # immediately if this session was mid-speech when told to stop,
+        # rather than leaving the Mac's shared queue blocked until aclose()
+        # itself finishes tearing the session down.
+        announce_coordinator.close()
         await session.aclose()
         if room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
             await room.disconnect()

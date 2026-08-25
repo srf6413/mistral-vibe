@@ -9,9 +9,21 @@ from livekit.agents.types import APIConnectOptions
 import pytest
 
 from tests.stubs.fake_tts_client import FakeTTSClient
+from vibe.cli.duplex_voice import announce_lock
 from vibe.cli.duplex_voice.mistral_tts_plugin import MistralDuplexTTS
 from vibe.cli.duplex_voice.standalone_defaults import default_speech_config_view
 from vibe.cli.tts.tts_client_port import TTSResult
+
+
+@pytest.fixture(autouse=True)
+def _isolated_announce_lock(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_run` awaits `wait_while_other_speaker()` before synthesizing (see
+    `announce_lock`'s module docstring) -- point it at a private lock file
+    instead of the real, Mac-wide `/tmp/.claude-announce.pidlock` so these
+    tests never contend with (or wait behind) whatever is actually holding
+    that lock on the machine running them.
+    """
+    monkeypatch.setattr(announce_lock, "_LOCK_PATH", str(tmp_path / "announce.pidlock"))
 
 
 def _make_wav_bytes(*, sample_rate: int, num_channels: int, duration_s: float) -> bytes:
