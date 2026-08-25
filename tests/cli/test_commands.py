@@ -258,3 +258,20 @@ class TestCommandRegistry:
         assert hasattr(VibeApp, cmd.handler), (
             f"CommandRegistry points at VibeApp.{cmd.handler}, which does not exist"
         )
+
+    def test_background_command_resolves_to_a_real_app_handler(self) -> None:
+        # Same seam as `test_workflows_command_resolves_to_a_real_app_handler`
+        # above, for `/background` (aliases `/background`, `/bg`).
+        from vibe.cli.textual_ui.app import VibeApp
+
+        registry = CommandRegistry()
+        for alias in ["/background", "/bg"]:
+            result = registry.parse_command(f"{alias} wf-abc123")
+            assert result is not None, alias
+            cmd_name, cmd, cmd_args = result
+            assert cmd_name == "background", alias
+            assert cmd_args == "wf-abc123", alias
+            assert cmd.handler == "_background_command"
+            assert hasattr(VibeApp, cmd.handler), (
+                f"CommandRegistry points at VibeApp.{cmd.handler}, which does not exist"
+            )
