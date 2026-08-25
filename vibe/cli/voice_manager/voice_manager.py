@@ -75,6 +75,11 @@ class VoiceManager:
         self._transcribe_task: Task[None] | None = None
         self._listeners: list[VoiceManagerListener] = []
         self._tracking = TranscriptionTrackingState()
+        # Single source of truth for mic-capture suppression; see
+        # VoiceManagerPort.muted.
+        self.muted: bool = False
+        # See VoiceManagerPort.duplex_active.
+        self.duplex_active: bool = False
 
     @property
     def is_enabled(self) -> bool:
@@ -101,6 +106,18 @@ class VoiceManager:
     def start_recording(self, mode: RecordingMode = RecordingMode.STREAM) -> None:
         if self._transcribe_state != TranscribeState.IDLE:
             return
+
+        if self.duplex_active:
+            # Duplex voice mode (vibe.cli.duplex_voice.mic_publisher) is
+            # already running its own continuous `sounddevice` capture
+            # against the same default microphone -- see
+            # `VoiceManagerPort.duplex_active`'s docstring. Refuse rather
+            # than open a second, competing capture stream and transcribe
+            # the same utterance through two independent pipelines.
+            raise RecordingStartError(
+                "Duplex voice mode is already listening -- Ctrl+R isn't "
+                "needed (or available) while it's on."
+            )
 
         if self._transcribe_client is None:
             logger.warning(

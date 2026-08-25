@@ -20,7 +20,8 @@ class TestVoiceAppVimKeybindings:
 
         app.on_key(events.Key("j", "j"))
 
-        assert app.selected_index == 1
+        # Wraps modulo the number of settings, same as action_move_down.
+        assert app.selected_index == 1 % len(app.settings)
 
     def test_k_wraps_to_last(self, app: VoiceApp):
         assert app.selected_index == 0

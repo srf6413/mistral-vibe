@@ -68,6 +68,7 @@ class ConfigView(ProtocolModel):
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
     voice_mode_enabled: bool
+    # Deprecated: narrator feature removed; field kept for wire compatibility.
     narrator_enabled: bool
     show_thinking_nodes: bool
     enable_update_checks: bool

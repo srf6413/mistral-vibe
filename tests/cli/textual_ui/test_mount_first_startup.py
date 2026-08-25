@@ -10,7 +10,6 @@ from vibe.app_server import AppServerSession
 from vibe.cli.textual_ui.widgets.banner.banner import Banner
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputBody, ChatInputContainer
 from vibe.cli.textual_ui.widgets.context_progress import ContextProgress
-from vibe.cli.textual_ui.widgets.narrator_status import NarratorStatus
 
 
 @pytest.mark.asyncio
@@ -26,7 +25,6 @@ async def test_compose_yields_main_ui_when_no_session() -> None:
         assert app._app_server is None
         assert app.query_one(Banner) is not None
         assert app.query_one(ChatInputContainer) is not None
-        assert app.query_one(NarratorStatus) is not None
 
 
 @pytest.mark.asyncio
@@ -46,10 +44,10 @@ async def test_registry_swapped_after_session_ready() -> None:
 
 @pytest.mark.asyncio
 async def test_real_managers_bound_to_widgets_after_cold_bootstrap() -> None:
-    # Cold mount-first path: compose binds the idle noop voice/narrator
-    # managers. Once the session opens, _complete_mount must re-bind the real
-    # managers into the already-mounted widgets so voice (Ctrl+R) and narrator
-    # status drive the real managers instead of the noops.
+    # Cold mount-first path: compose binds the idle noop voice manager. Once
+    # the session opens, _complete_mount must re-bind the real manager into
+    # the already-mounted widget so voice (Ctrl+R) drives the real manager
+    # instead of the noop.
     app = build_test_vibe_app()
     app._mount_first = True
     async with app.run_test(size=(120, 40)) as pilot:
@@ -61,8 +59,6 @@ async def test_real_managers_bound_to_widgets_after_cold_bootstrap() -> None:
         # verify it was rebound too, not just the body's listener slot.
         assert body.input_widget is not None
         assert body.input_widget._voice_manager is app._voice_manager
-        narrator_status = app.query_one(NarratorStatus)
-        assert narrator_status._narrator_manager is app._narrator_manager
 
 
 def test_cold_path_force_quit_does_not_access_config() -> None:

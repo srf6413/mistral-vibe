@@ -4,6 +4,7 @@ from tests.stubs.fake_audio_recorder import FakeAudioRecorder
 from vibe.cli.audio_recorder import AudioRecorderPort
 from vibe.cli.audio_recorder.audio_recorder_port import RecordingMode
 from vibe.cli.voice_manager.voice_manager_port import (
+    RecordingStartError,
     TranscribeState,
     VoiceManagerListener,
 )
@@ -20,6 +21,8 @@ class FakeVoiceManager:
         self._audio_recorder: AudioRecorderPort = audio_recorder or FakeAudioRecorder()
         self._transcribe_state = TranscribeState.IDLE
         self._listeners: list[VoiceManagerListener] = []
+        self.muted: bool = False
+        self.duplex_active: bool = False
 
     @property
     def is_enabled(self) -> bool:
@@ -41,6 +44,11 @@ class FakeVoiceManager:
             listener.on_voice_mode_change(self._enabled)
 
     def start_recording(self, mode: RecordingMode = RecordingMode.STREAM) -> None:
+        if self.duplex_active:
+            raise RecordingStartError(
+                "Duplex voice mode is already listening -- Ctrl+R isn't "
+                "needed (or available) while it's on."
+            )
         self._set_state(TranscribeState.RECORDING)
 
     async def stop_recording(self) -> None:

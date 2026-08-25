@@ -165,7 +165,6 @@ include_prompt_detail = true      # Include OS info, tool prompts, skills, and a
 
 # Voice features
 voice_mode_enabled = false
-narrator_enabled = false
 active_transcribe_model = "voxtral-realtime"
 active_tts_model = "voxtral-tts"
 ```

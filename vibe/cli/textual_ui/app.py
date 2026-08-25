@@ -98,6 +98,7 @@ from vibe.app_server.protocol import (
 )
 from vibe.app_server.session import AppServerTurnError
 from vibe.cli._process_title import process_id_label
+from vibe.cli.audio_player.mute_sound_cue import play_mute_cue
 from vibe.cli.clipboard import (
     NATIVE_COPY_HINT,
     ClipboardCopyResult,
@@ -107,13 +108,7 @@ from vibe.cli.clipboard import (
 from vibe.cli.commands import Command, CommandContext, CommandRegistry
 from vibe.cli.lazy_audio_managers import (
     check_audio_available,
-    create_default_narrator_manager,
     create_default_voice_manager,
-)
-from vibe.cli.narrator_manager.narrator_manager_port import (
-    NarratorManagerListener,
-    NarratorManagerPort,
-    NarratorState,
 )
 from vibe.cli.plan_offer.presentation import plan_offer_cta, plan_title
 from vibe.cli.process_start import PROCESS_START_MONOTONIC, PROCESS_START_WALLCLOCK
@@ -187,7 +182,6 @@ from vibe.cli.textual_ui.widgets.messages import (
     WhatsNewMessage,
 )
 from vibe.cli.textual_ui.widgets.model_picker import ModelOption, ModelPickerApp
-from vibe.cli.textual_ui.widgets.narrator_status import NarratorStatus
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.path_display import PathDisplay
 from vibe.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
@@ -287,6 +281,8 @@ _MAX_INCOMPLETE_STREAM_RETRIES = 2
 
 
 if TYPE_CHECKING:
+    from vibe.cli.duplex_voice.agent_bridge import VoiceTurnBridge
+    from vibe.cli.duplex_voice.supervisor import DuplexVoiceSupervisor
     from vibe.cli.textual_ui.screens.config import ConfigWriteResult
     from vibe.cli.textual_ui.widgets.connector_auth_app import ConnectorAuthApp
     from vibe.cli.textual_ui.widgets.mcp_app import MCPApp
@@ -543,28 +539,6 @@ def _split_app_server_source(
     return None, source
 
 
-class _IdleNarratorManager:
-    @property
-    def state(self) -> NarratorState:
-        return NarratorState.IDLE
-
-    @property
-    def is_playing(self) -> bool:
-        return False
-
-    def on_turn_start(self, user_message: str) -> None: ...
-    def on_user_message(self, message_id: str) -> None: ...
-    def on_assistant_text(self, content: str) -> None: ...
-    def on_turn_error(self, message: str) -> None: ...
-    def on_turn_cancel(self) -> None: ...
-    def on_turn_end(self) -> None: ...
-    def cancel(self) -> None: ...
-    def sync(self) -> None: ...
-    def add_listener(self, listener: NarratorManagerListener) -> None: ...
-    def remove_listener(self, listener: NarratorManagerListener) -> None: ...
-    async def close(self) -> None: ...
-
-
 class _IdleVoiceManager:
     @property
     def is_enabled(self) -> bool:
@@ -578,6 +552,13 @@ class _IdleVoiceManager:
     def peak(self) -> float:
         return 0.0
 
+    @property
+    def muted(self) -> bool:
+        return False
+
+    @muted.setter
+    def muted(self, value: bool) -> None: ...
+
     def apply_enabled(self, enabled: bool) -> None: ...
     def start_recording(self, mode: RecordingMode = RecordingMode.STREAM) -> None: ...
     async def stop_recording(self) -> None: ...
@@ -589,10 +570,6 @@ class _IdleVoiceManager:
 
 def _noop_voice_manager() -> VoiceManagerPort:
     return cast(VoiceManagerPort, _IdleVoiceManager())
-
-
-def _noop_narrator_manager() -> NarratorManagerPort:
-    return cast(NarratorManagerPort, _IdleNarratorManager())
 
 
 _REJECT_HINT_BUSY = "wait for the current job to finish."
@@ -625,6 +602,12 @@ class VibeApp(App):  # noqa: PLR0904
             "ctrl+g", "open_plan_in_editor", "Edit Plan", show=False, priority=False
         ),
         Binding("ctrl+backslash", "toggle_debug_console", "Debug Console", show=False),
+        # priority=True so this reaches the App before the focused chat text
+        # area — which otherwise swallows every key while a voice recording
+        # is in flight (see ChatTextArea._handle_voice_key) — and before
+        # ctrl+t reaches TextArea's own key handling. check_action() below
+        # keeps it a true no-op (not just silent) whenever voice mode is off.
+        Binding("ctrl+t", "toggle_mute", "Toggle Mute", show=False, priority=True),
     ]
 
     _greeting_message: GreetingMessage | None = None
@@ -642,7 +625,7 @@ class VibeApp(App):  # noqa: PLR0904
         patch_driver_parser()
         return driver_class
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         history_file: Path,
         app_server: AppServerSource,
@@ -653,7 +636,6 @@ class VibeApp(App):  # noqa: PLR0904
         current_version: str = CORE_VERSION,
         terminal_notifier: NotificationPort | None = None,
         voice_manager: VoiceManagerPort | None = None,
-        narrator_manager: NarratorManagerPort | None = None,
         vscode_extension_promo: VscodeExtensionPromo | None = None,
         **kwargs: Any,
     ) -> None:
@@ -662,9 +644,7 @@ class VibeApp(App):  # noqa: PLR0904
         self._client_dependencies_ready = False
         self._prepare_lock = asyncio.Lock()
         self._provided_voice_manager = voice_manager
-        self._provided_narrator_manager = narrator_manager
         self._voice_manager: VoiceManagerPort = _noop_voice_manager()
-        self._narrator_manager: NarratorManagerPort = _noop_narrator_manager()
         self.commands: CommandRegistry = CommandRegistry()
         self._loop_commands: ScheduledLoopCommands
         self._terminal_notifier = terminal_notifier or TextualNotificationAdapter(
@@ -677,6 +657,18 @@ class VibeApp(App):  # noqa: PLR0904
         self._interrupt_requested = False
         self._agent_task: asyncio.Task | None = None
         self._bash_task: asyncio.Task | None = None
+        # Duplex (LiveKit) voice service: lazily constructed the first time
+        # voice mode is toggled on (see `_start_duplex_voice`), torn down on
+        # toggle-off and on app shutdown. `_duplex_voice_event_sink`, when
+        # set, is called for every AppServerEvent this app already renders
+        # (see `_handle_turn_event`) so a duplex-voice utterance that lands
+        # mid-turn against a turn the keyboard path started still hears the
+        # response -- not so keyboard-only turns get spoken (they aren't:
+        # nothing subscribes to the bridge unless a voice utterance opened
+        # a listening stream first).
+        self._duplex_voice_supervisor: DuplexVoiceSupervisor | None = None
+        self._duplex_voice_bridge: VoiceTurnBridge | None = None
+        self._duplex_voice_event_sink: Callable[[AppServerEvent], None] | None = None
         self._init_controllers()
 
         self._loading_widget: LoadingWidget | None = None
@@ -751,9 +743,6 @@ class VibeApp(App):  # noqa: PLR0904
             return
         self._voice_manager = (
             self._provided_voice_manager or self._make_default_voice_manager()
-        )
-        self._narrator_manager = (
-            self._provided_narrator_manager or self._make_default_narrator_manager()
         )
         self.commands = self._build_command_registry()
         self._loop_commands = ScheduledLoopCommands(
@@ -886,7 +875,6 @@ class VibeApp(App):  # noqa: PLR0904
             mention_stats=mention_stats,
         )
         for event in events:
-            self._track_narrator_event(event)
             if self.event_handler:
                 await self.event_handler.handle_event(
                     event, loading_widget=self._loading_widget
@@ -970,7 +958,6 @@ class VibeApp(App):  # noqa: PLR0904
 
     async def _refresh_config_from_disk(self) -> None:
         await self.app_server.resources.config.reload(reload_runtime=False)
-        self._narrator_manager.sync()
         self._refresh_command_registry()
 
     def get_default_screen(self) -> Screen:
@@ -1018,7 +1005,6 @@ class VibeApp(App):  # noqa: PLR0904
             yield VerticalGroup(id="messages")
 
         with Horizontal(id="loading-area"):
-            yield NarratorStatus(self._narrator_manager)
             yield Static(id="loading-area-content")
             self._inline_notice = InlineNotice(id="inline-notice")
             yield self._inline_notice
@@ -1156,12 +1142,11 @@ class VibeApp(App):  # noqa: PLR0904
         self._chat_input_container = self.query_one(ChatInputContainer)
         self._chat_input_container.replace_command_registry(self.commands)
         self._refresh_command_registry()
-        # Compose binds idle noop voice/narrator managers on the cold mount-first
-        # path; the real managers were created in _initialize_client_dependencies.
-        # Re-bind them into the already-mounted widgets so voice input (Ctrl+R)
-        # and narrator status actually drive the real managers.
+        # Compose binds an idle noop voice manager on the cold mount-first path;
+        # the real manager was created in _initialize_client_dependencies.
+        # Re-bind it into the already-mounted widget so voice input (Ctrl+R)
+        # actually drives the real manager.
         self._chat_input_container.replace_voice_manager(self._voice_manager)
-        self.query_one(NarratorStatus).replace_narrator_manager(self._narrator_manager)
 
         self._refresh_profile_widgets()
 
@@ -1669,6 +1654,16 @@ class VibeApp(App):  # noqa: PLR0904
             except Exception as exc:
                 logger.warning("Failed to apply voice mode locally", exc_info=exc)
                 audio_error = str(exc)
+            # Skip starting the duplex service on top of an audio subsystem
+            # already known to be unavailable (pre-check failure above, or
+            # the basic voice manager itself just failed to enable) --
+            # don't pile a second, confusing failure notification onto the
+            # one already shown for the same underlying cause. Always
+            # still attempt to STOP it, though: that's a safe no-op if it
+            # was never running, and must not be skipped just because the
+            # simple voice manager had trouble.
+            if not voice_enabled or audio_error is None:
+                self._apply_duplex_voice_enabled(voice_enabled)
             self.app_server.resources.telemetry.record(
                 "vibe.voice_mode_toggled", {"enabled": voice_enabled}
             )
@@ -1678,7 +1673,6 @@ class VibeApp(App):  # noqa: PLR0904
                 else "Voice mode disabled."
             )
             await self._mount_and_scroll(UserCommandMessage(message))
-        self._narrator_manager.sync()
         self._refresh_command_registry()
         if audio_error:
             self.notify(
@@ -1687,6 +1681,107 @@ class VibeApp(App):  # noqa: PLR0904
                 timeout=15,
                 markup=False,
             )
+
+    def _apply_duplex_voice_enabled(self, enabled: bool) -> None:
+        """Start/stop the duplex (LiveKit) voice service alongside the
+        existing simple push-to-talk voice manager, whenever
+        `voice_mode_enabled` toggles.
+
+        Runs as a background worker rather than being awaited inline: this
+        method is called from inside a queued command's payload (see
+        `_handle_voice_settings_closed`), and `DuplexVoiceSupervisor.start()`
+        can legitimately take several seconds (booting a real
+        `livekit-server --dev`) -- awaiting it here would stall queue drain
+        and keyboard input for that whole window.
+        """
+        self.run_worker(
+            self._toggle_duplex_voice(enabled),
+            exclusive=True,
+            group="duplex-voice",
+        )
+
+    async def _toggle_duplex_voice(self, enabled: bool) -> None:
+        if enabled:
+            await self._start_duplex_voice()
+        else:
+            await self._stop_duplex_voice()
+
+    async def _start_duplex_voice(self) -> None:
+        if self._duplex_voice_supervisor is not None:
+            return
+        # Imported lazily (not at module level) so `livekit` is never
+        # imported -- and never costs any startup time -- for a session
+        # that never turns voice mode on.
+        from vibe.cli.duplex_voice.agent_bridge import VoiceTurnBridge
+        from vibe.cli.duplex_voice.jarvis_llm import JarvisBridgeLLM
+        from vibe.cli.duplex_voice.supervisor import DuplexVoiceSupervisor
+
+        bridge = VoiceTurnBridge(
+            turn_active=lambda: self.app_server.turn_active,
+            # Reusing the app's own turn-dispatch methods verbatim -- the
+            # exact ones the keyboard/queue path already calls -- rather
+            # than re-implementing act()/inject_user_context() dispatch
+            # here. See `VoiceTurnBridge`'s docstring for why a transcript
+            # is routed through these instead of the bridge awaiting
+            # `act()`'s event stream itself.
+            start_new_turn=self._start_queued_agent_turn,
+            inject_mid_turn=self._inject_queued_prompt,
+        )
+        config = self.app_server.resources.config.current
+        supervisor = DuplexVoiceSupervisor(
+            transcription=config.transcription,
+            speech=config.speech,
+            llm_factory=lambda: JarvisBridgeLLM(bridge),
+            enable_mic=True,
+            enable_playback=True,
+            muted=lambda: self._voice_manager.muted,
+        )
+        self._duplex_voice_bridge = bridge
+        self._duplex_voice_supervisor = supervisor
+        self._duplex_voice_event_sink = bridge.on_history_event
+        try:
+            await supervisor.start()
+            # Only flip on once duplex is actually up: duplex-mic capture
+            # and the old push-to-talk path (Ctrl+R) both open their own
+            # `sounddevice` input stream against the default microphone --
+            # see `VoiceManager.duplex_active`'s docstring for why they
+            # must not run at once. If `start()` raises below, this must
+            # stay False so Ctrl+R keeps working as the fallback.
+            self._voice_manager.duplex_active = True
+        except BaseException as exc:
+            # BaseException, not Exception: this runs inside a worker (see
+            # `_apply_duplex_voice_enabled`) that Textual cancels on app
+            # shutdown or on a rapid second toggle (`exclusive=True`
+            # cancels the still-running previous one) -- CancelledError
+            # must reach this cleanup too, or a `livekit-server` subprocess
+            # that `start()` already spawned before being cancelled would
+            # be orphaned instead of torn down. A controlled
+            # `DuplexVoiceSupervisorError` (port taken, server/agent didn't
+            # come up in time) gets the exact same cleanup.
+            logger.warning("Failed to start duplex voice service", exc_info=exc)
+            with suppress(Exception):
+                await supervisor.stop()
+            self._duplex_voice_supervisor = None
+            self._duplex_voice_bridge = None
+            self._duplex_voice_event_sink = None
+            self._voice_manager.duplex_active = False
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            self.notify(
+                f"Duplex voice service failed to start: {exc}",
+                severity="warning",
+                timeout=15,
+                markup=False,
+            )
+
+    async def _stop_duplex_voice(self) -> None:
+        supervisor = self._duplex_voice_supervisor
+        self._duplex_voice_supervisor = None
+        self._duplex_voice_bridge = None
+        self._duplex_voice_event_sink = None
+        self._voice_manager.duplex_active = False
+        if supervisor is not None:
+            await supervisor.stop()
 
     async def _remove_config_field(self, field: str) -> None:
         response = await self.app_server.resources.config.write(
@@ -1753,7 +1848,6 @@ class VibeApp(App):  # noqa: PLR0904
         audio_error = (
             check_audio_available()
             if changes.get("voice_mode_enabled") is True
-            or changes.get("narrator_enabled") is True
             else None
         )
         await self._queue.enqueue_command(
@@ -2513,7 +2607,13 @@ class VibeApp(App):  # noqa: PLR0904
             await self._handle_turn_event(event)
 
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
-        self._track_narrator_event(event)
+        # Feeds the duplex voice bridge's TTS-out, when voice mode is on --
+        # a no-op sink otherwise. Called unconditionally, before any of the
+        # early returns below, so it sees every event this method handles
+        # regardless of type (it only actually reacts to streaming
+        # assistant-message text; see `VoiceTurnBridge.on_history_event`).
+        if self._duplex_voice_event_sink is not None:
+            self._duplex_voice_event_sink(event)
         if isinstance(event, ServerWarning):
             self.notify(event.params.warning.message, severity="warning")
             return
@@ -2551,37 +2651,16 @@ class VibeApp(App):  # noqa: PLR0904
         self._queue.notify_busy_changed()
         await self._remove_loading_widget()
         await self._ensure_loading_widget()
-        self._narrator_manager.cancel()
-        self._narrator_manager.on_turn_start("")
 
     async def _complete_unsolicited_turn(self, event: TurnCompleted) -> None:
         if event.turn.status is PublicTurnStatus.FAILED:
             error = AppServerTurnError(event.turn.error)
             await self._handle_turn_error()
             message = self._resolve_turn_error_message(error)
-            self._narrator_manager.on_turn_error(message)
             await self._mount_turn_error(error, message)
         elif event.turn.status is PublicTurnStatus.INTERRUPTED:
             await self._handle_turn_error(cancelled=True)
-            self._narrator_manager.on_turn_cancel()
         await self._finalize_turn_ui()
-
-    def _track_narrator_event(self, event: AppServerEvent) -> None:
-        match event:
-            case HistoryEntryAdded(entry=PublicMessageEntry(role="user") as entry):
-                self._narrator_manager.on_user_message(entry.id)
-            case HistoryEntryAdded(entry=PublicMessageEntry(role="assistant") as entry):
-                self._narrator_manager.on_assistant_text(entry.text)
-            case HistoryEntryUpdated(
-                entry=PublicMessageEntry(role="assistant"), patch=patch
-            ):
-                for operation in patch:
-                    if (
-                        operation.op == "append"
-                        and operation.path == "/content/0/text"
-                        and isinstance(operation.value, str)
-                    ):
-                        self._narrator_manager.on_assistant_text(operation.value)
 
     async def _handle_turn(
         self,
@@ -2616,8 +2695,6 @@ class VibeApp(App):  # noqa: PLR0904
                 images = prepared.images or None
                 mentions = prepared.mentions
             message_id = None if injected else client_message_id or str(uuid4())
-            self._narrator_manager.cancel()
-            self._narrator_manager.on_turn_start("" if injected else prompt_text)
             async with aclosing(
                 self.app_server.act(
                     prompt_text,
@@ -2631,7 +2708,6 @@ class VibeApp(App):  # noqa: PLR0904
                 await self._handle_turn_events(events)
         except asyncio.CancelledError:
             await self._handle_turn_error(cancelled=True)
-            self._narrator_manager.on_turn_cancel()
             raise
         except Exception as e:
             await self._handle_turn_error()
@@ -2672,11 +2748,22 @@ class VibeApp(App):  # noqa: PLR0904
                     )
 
                 message = self._resolve_turn_error_message(e)
-                self._narrator_manager.on_turn_error(message)
 
                 await self._mount_turn_error(e, message)
         finally:
             await self._finalize_turn_ui(resume_queue=not retry_incomplete_stream)
+            # Tells the duplex voice bridge (if any subscriber is currently
+            # listening) that THIS turn is over, regardless of whether it
+            # was started by voice or by the keyboard/queue path -- the
+            # bridge itself has no other reliable way to see a turn all the
+            # way to its end (mid-turn `inject_user_context` steers an
+            # already-running turn without creating a new task to watch,
+            # and `act()` never yields TurnCompleted to its own solicited
+            # caller). Skipped while about to silently retry: the stream
+            # isn't actually over yet, and closing it here would finalize
+            # TTS output for content that's still incomplete.
+            if not retry_incomplete_stream and self._duplex_voice_bridge is not None:
+                self._duplex_voice_bridge.on_turn_finished()
 
         if retry_incomplete_stream:
             await self._auto_retry_incomplete_stream(incomplete_stream_retries + 1)
@@ -2733,7 +2820,6 @@ class VibeApp(App):  # noqa: PLR0904
         self._queue.notify_busy_changed()
 
     async def _finalize_turn_ui(self, *, resume_queue: bool = True) -> None:
-        self._narrator_manager.on_turn_end()
         self._interrupt_requested = False
         self._agent_task = None
         if self._loading_widget:
@@ -3736,7 +3822,6 @@ class VibeApp(App):  # noqa: PLR0904
     async def _apply_config_to_ui(self) -> None:
         await self._apply_theme(self.config.theme)
         await self._refresh_account()
-        self._narrator_manager.sync()
         self.run_worker(self._refresh_identity(), exclusive=False)
         self._sync_greeting_message()
 
@@ -4594,13 +4679,6 @@ class VibeApp(App):  # noqa: PLR0904
         if self._try_interrupt_bottom_app_escape():
             return True
 
-        if (
-            self._narrator_manager.is_playing
-            or self._narrator_manager.state != NarratorState.IDLE
-        ):
-            self._narrator_manager.cancel()
-            return True
-
         return False
 
     def _try_interrupt_running_job(self) -> bool:
@@ -4640,12 +4718,26 @@ class VibeApp(App):  # noqa: PLR0904
             and screen_id.startswith("config-")
         ):
             return False
+        if action == "toggle_mute" and not self._voice_manager.is_enabled:
+            return False
         return True
 
     def action_interrupt(self) -> None:
         if self._app_server is None:
             return
         self._try_interrupt()
+
+    def action_toggle_mute(self) -> None:
+        # Global mute toggle for voice mode's mic input; a no-op while voice
+        # mode is off (also gated via check_action above). This only affects
+        # capture — playback is untouched. `muted` is the single flag a later
+        # duplex-voice pipeline will read to decide whether to suppress mic
+        # input; this action just flips it and plays the matching cue.
+        if not self._voice_manager.is_enabled:
+            return
+        muted = not self._voice_manager.muted
+        self._voice_manager.muted = muted
+        play_mute_cue(muted)
 
     async def on_history_load_more_requested(self, _: HistoryLoadMoreRequested) -> None:
         self._load_more.set_enabled(False)
@@ -4909,13 +5001,20 @@ class VibeApp(App):  # noqa: PLR0904
                 self._agent_task.cancel()
             if self._bash_task and not self._bash_task.done():
                 self._bash_task.cancel()
-            self._narrator_manager.cancel()
         finally:
             self.exit(result=self._get_session_exit_summary())
 
     async def shutdown_cleanup(self) -> None:
         with suppress(Exception):
             await self._begin_shutdown()
+        # Stop the duplex voice service (livekit-server + in-process agent
+        # + mic publisher) before anything else below touches `app_server`
+        # or `_agent_task` -- covers normal quit, ctrl+c/ctrl+d (routed
+        # through `_force_quit`/`shutdown_cleanup` the same way), and
+        # SIGTERM, so no orphaned `livekit-server` process is left behind
+        # on any exit path. A no-op when voice mode was never turned on.
+        with suppress(Exception):
+            await self._stop_duplex_voice()
         for task in (self._agent_task, self._bash_task):
             if task is None or task.done():
                 continue
@@ -4928,8 +5027,6 @@ class VibeApp(App):  # noqa: PLR0904
         if self._client_dependencies_ready:
             with suppress(Exception):
                 await self._voice_manager.close()
-            with suppress(Exception):
-                await self._narrator_manager.close()
         if self._app_server is not None:
             with suppress(Exception):
                 await self._app_server.close()
@@ -5263,13 +5360,6 @@ class VibeApp(App):  # noqa: PLR0904
         # Textual doesn't repaint after resuming from Ctrl+Z (SIGTSTP);
         # force a full layout refresh so the UI isn't garbled.
         self.refresh(layout=True)
-
-    def _make_default_narrator_manager(self) -> NarratorManagerPort:
-        return create_default_narrator_manager(
-            config_getter=lambda: self.config,
-            summary_generator=self.app_server.resources.narration,
-            telemetry_client=self.app_server.resources.telemetry,
-        )
 
     def _handle_exception(self, error: Exception) -> None:
         if not isinstance(error, WorkerFailed):

@@ -63,6 +63,7 @@ dependencies = [
     "jsonschema-specifications==2025.9.1",
     "keyring==25.7.0",
     "linkify-it-py==2.1.0",
+    "livekit-agents>=1.7.0",
     "markdown-it-py==4.0.0",
     "markdownify==1.2.3",
     "mcp==1.28.1",
