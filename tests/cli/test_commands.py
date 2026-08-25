@@ -241,3 +241,16 @@ class TestCommandRegistry:
         help_text = registry.get_help_text()
         for alias in ["`/exit`", "`exit`", "`quit`", "`:q`", "`:quit`"]:
             assert alias in help_text, alias
+
+    def test_compact_is_not_a_registered_command(self) -> None:
+        """`/compact` has no client-side backend (FounderOSAskSession.compact()
+        unconditionally raises), so it must not be intercepted here. With no
+        registry entry, input_kinds.classify() falls through to Prompt and the
+        raw text reaches FounderOS /ask, where the server-side memory-command
+        parser already handles literal "/compact" text correctly — the same
+        path /remember, /recall, /lessons, and /synth already rely on.
+        """
+        registry = CommandRegistry()
+        assert registry.get_command_name("/compact") is None
+        assert registry.parse_command("/compact") is None
+        assert "compact" not in registry.commands

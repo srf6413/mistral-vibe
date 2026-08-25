@@ -116,11 +116,6 @@ class CommandRegistry:
                 handler="action_toggle_debug_console",
                 side_channel=True,
             ),
-            "compact": Command(
-                aliases=frozenset(["/compact"]),
-                description="Compact conversation history by summarizing. Optionally pass instructions to guide the summary",
-                handler="_compact_history",
-            ),
             "exit": Command(
                 aliases=frozenset(["/exit", "exit", "quit", ":q", ":quit"]),
                 description="Exit the application",

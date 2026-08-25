@@ -20,13 +20,13 @@ async def test_popup_appears_with_matching_suggestions(vibe_app: VibeApp) -> Non
         chat_input = vibe_app.query_one(ChatInputContainer)
         popup = vibe_app.query_one(CompletionPopup)
 
-        await pilot.press(*"/com")
+        await pilot.press(*"/conf")
 
         popup_content = popup.content_text
         assert popup.styles.display == "block"
-        assert "/compact" in popup_content
-        assert "Compact conversation history by summarizing" in popup_content
-        assert chat_input.value == "/com"
+        assert "/config" in popup_content
+        assert "Edit config settings" in popup_content
+        assert chat_input.value == "/conf"
 
 
 @pytest.mark.asyncio
@@ -100,7 +100,7 @@ async def test_arrow_navigation_cycles_through_suggestions(vibe_app: VibeApp) ->
 
         ensure_selected_command(popup, "/config")
         await pilot.press("down")
-        ensure_selected_command(popup, "/compact")
+        ensure_selected_command(popup, "/connectors")
         await pilot.press("up")
         ensure_selected_command(popup, "/config")
 
