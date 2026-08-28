@@ -17,6 +17,7 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 from livekit.agents.utils import shortuuid
 
 from vibe.app_server.config import AudioProviderView, TTSModelConfigView
+from vibe.cli.duplex_voice.announce_lock import wait_while_other_speaker
 from vibe.cli.tts.mistral_tts_client import MistralTTSClient
 
 if TYPE_CHECKING:
@@ -87,6 +88,11 @@ class MistralChunkedStream(tts.ChunkedStream):
         self._client = client
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        # Wait out a `speak.sh`-driven Mac announcement already in progress
+        # before this utterance starts speaking -- the synth-side half of
+        # the shared announce lock (see `announce_lock`'s module
+        # docstring); `SpeakingLockCoordinator` holds the other half.
+        await wait_while_other_speaker()
         logger.info("synthesizing %d chars", len(self._input_text))
         try:
             result = await self._client.speak(self._input_text)
